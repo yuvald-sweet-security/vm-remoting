@@ -34,22 +34,50 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$ConfigPath  = Join-Path $PSScriptRoot '.vm-targets.json'
-$CredDir     = Join-Path $PSScriptRoot '.vm-creds'
+
+# OS-standard per-user config directory (mirrors the vm-remoting MCP server).
+function Get-OsConfigDir {
+    if ($IsWindows) {
+        if ($env:APPDATA) { return (Join-Path $env:APPDATA 'vm-remoting') }
+    } else {
+        if ($env:XDG_CONFIG_HOME) { return (Join-Path $env:XDG_CONFIG_HOME 'vm-remoting') }
+        if ($env:HOME)            { return (Join-Path $env:HOME '.config/vm-remoting') }
+    }
+    Join-Path ([System.IO.Path]::GetTempPath()) 'vm-remoting'
+}
+
+# Locate .vm-targets.json the same way the MCP server does, so both front-ends share one
+# config (first match wins): explicit file, then config dir, then the current directory,
+# then the OS per-user config dir (%APPDATA%\vm-remoting on Windows).
+function Resolve-ConfigPath {
+    if ($env:VM_TARGETS_FILE) { return $env:VM_TARGETS_FILE }
+    if ($env:VM_CONFIG_DIR)   { return (Join-Path $env:VM_CONFIG_DIR '.vm-targets.json') }
+    $cwd = Join-Path (Get-Location).Path '.vm-targets.json'
+    if (Test-Path -LiteralPath $cwd -PathType Leaf) { return $cwd }
+    Join-Path (Get-OsConfigDir) '.vm-targets.json'
+}
+
+$ConfigPath = Resolve-ConfigPath
+$ConfigDir  = Split-Path -Parent $ConfigPath
+if (-not $ConfigDir) { $ConfigDir = (Get-Location).Path }   # bare filename -> current dir
+$CredDir    = Join-Path $ConfigDir '.vm-creds'
 
 function Read-Config {
-    if (-not (Test-Path $ConfigPath)) {
+    if (-not (Test-Path -LiteralPath $ConfigPath)) {
         return [pscustomobject]@{ current = $null; targets = [pscustomobject]@{} }
     }
-    Get-Content -Raw $ConfigPath | ConvertFrom-Json
+    Get-Content -Raw -LiteralPath $ConfigPath | ConvertFrom-Json
 }
 
 function Write-Config($cfg) {
     # Write to a unique temp file then atomically replace, so a concurrent reader
     # never sees a truncated/partial config (two `use` calls at once = last writer wins,
     # cleanly, instead of a torn file). PID keeps the temp name collision-free.
+    if ($ConfigDir -and -not (Test-Path -LiteralPath $ConfigDir)) {
+        New-Item -ItemType Directory -Path $ConfigDir -Force | Out-Null
+    }
     $tmp = "$ConfigPath.$PID.tmp"
-    $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $tmp -Encoding UTF8
+    $cfg | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $tmp -Encoding UTF8
     Move-Item -LiteralPath $tmp -Destination $ConfigPath -Force
 }
 
