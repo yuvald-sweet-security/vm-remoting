@@ -1,2 +1,3 @@
+/target
 .vm-targets.json
-.vm-creds/
+.vm-creds

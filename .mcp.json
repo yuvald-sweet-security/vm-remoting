@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "vm-remoting": {
+      "command": "vm-remoting-mcp"
+    }
+  }
+}
