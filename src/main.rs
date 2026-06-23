@@ -1,11 +1,14 @@
 //! MCP server exposing a multi-backend remoting dispatcher as Model Context Protocol tools.
 //!
-//! It runs a command on a configured remote target, driving each target type directly:
-//!   * `wsl`    → `wsl.exe -d <distro> [-u <user>] -- bash -lc <cmd>`
-//!   * `ssh`    → `ssh [-i key] [-p port] -o BatchMode=yes [-o opt]... <dest> <cmd>`
+//! It runs a command on a configured remote target, driving each target type directly. The
+//! guest command is delivered over stdin (wsl/ssh) or an env var (hyperv), never on the
+//! command line, so transport-layer quoting can't corrupt it:
+//!   * `wsl`    → `wsl.exe -d <distro> [-u <user>] -- bash -ls`   (command on stdin)
+//!   * `ssh`    → `ssh [-i key] [-p port] -o BatchMode=yes [-o opt]... <dest> bash -ls` (command on
+//!     stdin)
 //!   * `hyperv` → `pwsh` running `Invoke-Command -VMName ... [-Credential ...]` (PowerShell Direct
 //!     is the only way into a Hyper-V guest, so this one backend needs PowerShell — the dispatch
-//!     logic itself lives here).
+//!     logic itself lives here; the command travels in via `$env:VM_GUEST_CMD`).
 //!
 //! Targets are read from a `.vm-targets.json` file, located via (first match wins):
 //!   1. `VM_TARGETS_FILE`            — explicit path to the JSON file
@@ -37,7 +40,7 @@ use rmcp::{
     transport::stdio,
 };
 use serde::Deserialize;
-use tokio::process::Command;
+use tokio::{io::AsyncWriteExt, process::Command};
 use tracing_subscriber::EnvFilter;
 
 /// Fixed PowerShell program used for Hyper-V targets. All per-call values (VM name, guest
@@ -171,11 +174,21 @@ struct CommandPlan {
     program: String,
     args: Vec<String>,
     env: Vec<(String, Option<String>)>,
+    /// Command to feed to the child via stdin instead of the command line. Used for the
+    /// `wsl`/`ssh` backends so the guest command never passes through `wsl.exe`/`ssh.exe`
+    /// argument quoting (which mangles single quotes, `$`, etc.). `None` means no stdin.
+    stdin: Option<String>,
 }
 
 /// Decide how to invoke `command` on `target`. `pwsh` is the PowerShell executable used for
 /// Hyper-V targets. This performs no I/O — see [`VmServer::run_on`] for the credential
 /// preflight and the actual spawn.
+///
+/// For `wsl`/`ssh` the guest command is delivered over stdin to `bash -ls` (a login shell
+/// reading from stdin) rather than as an argv element. Passing it as an argument means it
+/// survives two rounds of quoting (Rust's Windows command-line encoding, then `wsl.exe`/
+/// `ssh.exe`'s own parsing), which corrupts quotes — e.g. single-quoted text gets expanded.
+/// stdin sidesteps all of that. Hyper-V already avoids the problem via environment variables.
 fn plan_command(pwsh: &str, target: &Target, command: &str) -> CommandPlan {
     match target {
         Target::Wsl { distro, user } => {
@@ -188,16 +201,12 @@ fn plan_command(pwsh: &str, target: &Target, command: &str) -> CommandPlan {
                 args.push("-u".into());
                 args.push(u.clone());
             }
-            args.extend([
-                "--".into(),
-                "bash".into(),
-                "-lc".into(),
-                command.to_string(),
-            ]);
+            args.extend(["--".into(), "bash".into(), "-ls".into()]);
             CommandPlan {
                 program: "wsl.exe".into(),
                 args,
                 env: Vec::new(),
+                stdin: Some(command.to_string()),
             }
         }
         Target::Ssh {
@@ -226,11 +235,14 @@ fn plan_command(pwsh: &str, target: &Target, command: &str) -> CommandPlan {
                 Some(u) => format!("{u}@{host}"),
                 None => host.clone(),
             });
-            args.push(command.to_string());
+            // Run a login shell that reads the command from the forwarded stdin.
+            args.push("bash".into());
+            args.push("-ls".into());
             CommandPlan {
                 program: "ssh".into(),
                 args,
                 env: Vec::new(),
+                stdin: Some(command.to_string()),
             }
         }
         Target::Hyperv { vm_name, cred_path } => CommandPlan {
@@ -247,6 +259,7 @@ fn plan_command(pwsh: &str, target: &Target, command: &str) -> CommandPlan {
                 ("VM_GUEST_CMD".into(), Some(command.to_string())),
                 ("VM_CREDPATH".into(), cred_path.clone()),
             ],
+            stdin: None,
         },
     }
 }
@@ -333,10 +346,35 @@ impl VmServer {
                 None => cmd.env_remove(key),
             };
         }
-        cmd.stdin(Stdio::null());
-        cmd.output().await.map_err(|e| {
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(if plan.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+
+        let launch_err = |e: std::io::Error| {
             McpError::internal_error(format!("failed to launch '{}': {e}", plan.program), None)
-        })
+        };
+        let mut child = cmd.spawn().map_err(launch_err)?;
+
+        // Feed the guest command over stdin (wsl/ssh), then close it so `bash -ls` hits EOF
+        // and runs. The payload is tiny, so writing it before draining output can't deadlock.
+        if let Some(input) = &plan.stdin {
+            let mut child_stdin = child.stdin.take().expect("stdin was piped");
+            child_stdin
+                .write_all(format!("{input}\n").as_bytes())
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(
+                        format!("failed to send command to '{}': {e}", plan.program),
+                        None,
+                    )
+                })?;
+            drop(child_stdin);
+        }
+
+        child.wait_with_output().await.map_err(launch_err)
     }
 
     #[tool(
@@ -639,19 +677,12 @@ mod tests {
         };
         let plan = plan_command("pwsh", &t, "uname -a");
         assert_eq!(plan.program, "wsl.exe");
+        // Command goes over stdin, not the argv (avoids wsl.exe quote mangling).
         assert_eq!(
             args_of(&plan),
-            [
-                "-d",
-                "Ubuntu-Claude",
-                "-u",
-                "dev",
-                "--",
-                "bash",
-                "-lc",
-                "uname -a"
-            ]
+            ["-d", "Ubuntu-Claude", "-u", "dev", "--", "bash", "-ls"]
         );
+        assert_eq!(plan.stdin.as_deref(), Some("uname -a"));
         assert!(plan.env.is_empty());
     }
 
@@ -662,7 +693,8 @@ mod tests {
             user: None,
         };
         let plan = plan_command("pwsh", &t, "echo hi");
-        assert_eq!(args_of(&plan), ["--", "bash", "-lc", "echo hi"]);
+        assert_eq!(args_of(&plan), ["--", "bash", "-ls"]);
+        assert_eq!(plan.stdin.as_deref(), Some("echo hi"));
     }
 
     #[test]
@@ -688,9 +720,11 @@ mod tests {
                 "-o",
                 "StrictHostKeyChecking=accept-new",
                 "ubuntu@1.2.3.4",
-                "ls -la"
+                "bash",
+                "-ls"
             ]
         );
+        assert_eq!(plan.stdin.as_deref(), Some("ls -la"));
     }
 
     #[test]
@@ -703,7 +737,30 @@ mod tests {
             options: vec![],
         };
         let plan = plan_command("pwsh", &t, "whoami");
-        assert_eq!(args_of(&plan), ["-o", "BatchMode=yes", "host", "whoami"]);
+        assert_eq!(
+            args_of(&plan),
+            ["-o", "BatchMode=yes", "host", "bash", "-ls"]
+        );
+        assert_eq!(plan.stdin.as_deref(), Some("whoami"));
+    }
+
+    #[test]
+    fn plan_wsl_command_never_appears_in_argv() {
+        // The whole point of the stdin fix: a command with quotes/`$` must not be on the
+        // command line where wsl.exe can mangle it.
+        let t = Target::Wsl {
+            distro: None,
+            user: None,
+        };
+        let tricky = "echo 'literal $HOME' \"$(id -u)\"";
+        let plan = plan_command("pwsh", &t, tricky);
+        assert!(
+            !plan
+                .args
+                .iter()
+                .any(|a| a.contains("$") || a.contains('\''))
+        );
+        assert_eq!(plan.stdin.as_deref(), Some(tricky));
     }
 
     #[test]
@@ -729,6 +786,8 @@ mod tests {
                 ("VM_CREDPATH".to_string(), Some("c.xml".to_string())),
             ]
         );
+        // Hyper-V passes the command via env, not stdin.
+        assert_eq!(plan.stdin, None);
     }
 
     #[test]
