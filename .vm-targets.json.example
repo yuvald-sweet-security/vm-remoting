@@ -1,0 +1,20 @@
+{
+  "current": "ubuntu",
+  "targets": {
+    "winvm": {
+      "type": "hyperv",
+      "vmName": "Windows 11",
+      "credPath": "..." // use `vm.ps1 save-cred winvm` to generate
+    },
+    "ssh": {
+      "type": "ssh",
+      "host": "REPLACE-WITH-HOST-OR-IP",
+      "user": "ubuntu",
+      "key": "..."
+    },
+    "ubuntu": {
+      "type": "wsl",
+      "distro": "Ubuntu-Claude"
+    }
+  }
+}
