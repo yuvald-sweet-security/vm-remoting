@@ -5,11 +5,15 @@
 back. Use it for any "run X on the VM / EC2 / WSL" request instead of raw
 `Invoke-Command -VMName`, `ssh`, or `wsl`.
 
-Do **not** use `vm.ps1 use <name>` followed by a bare command. The active-target pointer
-(`current` in `.vm-targets.json`) is global shared state; if anything else switches it
-between your `use` and your command, your command silently runs on the wrong target.
-`-Target` makes each call self-contained and race-free. Reserve `use` for interactive
-human convenience only.
+**Default to the bare command** (`vm.ps1 '<cmd>'`), which runs on the active target. Use
+it unless you know the request needs a *specific* VM — then pass `-Target <name>` so the
+call is self-contained and race-free.
+
+Do **not** call `vm.ps1 use <name>` yourself to switch the active target before running a
+command. The active-target pointer (`current` in `.vm-targets.json`) is global shared
+state; a programmatic `use` can race with other callers, silently running your command on
+the wrong target. Reading the active target with a bare command is fine — the human set
+it; *changing* it is what's unsafe. Reserve `use` for interactive human convenience only.
 
 ## How to invoke it
 
@@ -17,7 +21,8 @@ Use the **PowerShell tool** and invoke the script by its bare absolute path — 
 the call operator `&`**:
 
 ```
-D:\claude-remoting\vm.ps1 -Target winvm 'hostname'
+D:\claude-remoting\vm.ps1 'hostname'                 # active target — the default
+D:\claude-remoting\vm.ps1 -Target winvm 'hostname'   # only when a specific VM is required
 ```
 
 Why no `&`: the permission engine parses the PowerShell AST and matches on the command
@@ -41,8 +46,8 @@ won't auto-approve and you get a prompt every time. Invoking the bare path lets 
 | Command | Purpose |
 |---|---|
 | `vm.ps1 list` | List targets; `*` marks the active one. |
-| `vm.ps1 -Target <name> '<cmd>'` | Run a command on a specific target. **Preferred.** |
-| `vm.ps1 '<cmd>'` | Run on the active target. Avoid when concurrency is possible. |
+| `vm.ps1 '<cmd>'` | Run on the active target. **Default — use unless a specific VM is required.** |
+| `vm.ps1 -Target <name> '<cmd>'` | Run on a specific target. Use when the request needs a particular VM, or for race-free concurrency. |
 | `vm.ps1 use <name>` | Set active target (human convenience; don't rely on it programmatically). |
 | `vm.ps1 save-cred <name>` | Store Hyper-V guest credentials. **Interactive — the user must run this**, not me. |
 
@@ -53,7 +58,8 @@ won't auto-approve and you get a prompt every time. Invoking the bare path lets 
   exit code. Check it to know if a command succeeded.
 - **Concurrency:** running commands in parallel against the same or different targets is
   safe — each call opens its own fresh session/connection. Config writes are atomic. The
-  only unsafe pattern is relying on `current`/`use` from concurrent callers (see golden rule).
+  only unsafe pattern is *switching* the active target with `use` and relying on it; if
+  concurrent callers might need different targets, pass `-Target` on each (see above).
 
 ## Hyper-V credentials
 
