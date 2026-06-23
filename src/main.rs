@@ -386,7 +386,13 @@ impl VmServer {
         })?;
 
         let out = self.run_on(target, &args.command).await?;
-        Ok(render_output(&out.stdout, &out.stderr, out.status.code()))
+        Ok(render_output(
+            &args.command,
+            &name,
+            &out.stdout,
+            &out.stderr,
+            out.status.code(),
+        ))
     }
 }
 
@@ -405,32 +411,41 @@ fn render_list(cfg: &Config) -> String {
     out.trim_end().to_string()
 }
 
-/// Turn captured process output into an MCP tool result: combined stdout/stderr plus a
-/// trailing exit-code line. A non-zero (or absent) exit is surfaced as a tool error so the
-/// caller notices failures.
-fn render_output(stdout: &[u8], stderr: &[u8], code: Option<i32>) -> CallToolResult {
+/// Turn captured process output into an MCP tool result. The result leads with a header
+/// echoing the command and the target it ran on (so the UI shows what produced the output),
+/// followed by the combined stdout/stderr and a trailing exit-code line. A non-zero (or
+/// absent) exit is surfaced as a tool error so the caller notices failures.
+fn render_output(
+    command: &str,
+    target: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+    code: Option<i32>,
+) -> CallToolResult {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
 
-    let mut body = String::new();
+    let mut out = String::new();
     if !stdout.trim().is_empty() {
-        body.push_str(stdout.trim_end_matches('\n'));
+        out.push_str(stdout.trim_end_matches('\n'));
     }
     if !stderr.trim().is_empty() {
-        if !body.is_empty() {
-            body.push('\n');
+        if !out.is_empty() {
+            out.push('\n');
         }
-        body.push_str("[stderr]\n");
-        body.push_str(stderr.trim_end_matches('\n'));
+        out.push_str("[stderr]\n");
+        out.push_str(stderr.trim_end_matches('\n'));
     }
-    if body.is_empty() {
-        body.push_str("(no output)");
+    if out.is_empty() {
+        out.push_str("(no output)");
     }
 
-    body.push_str(&match code {
-        Some(c) => format!("\n\n[exit code: {c}]"),
-        None => "\n\n[terminated without an exit code]".to_string(),
-    });
+    let exit = match code {
+        Some(c) => format!("[exit code: {c}]"),
+        None => "[terminated without an exit code]".to_string(),
+    };
+    // `target$ command` reads like a shell prompt, making the origin of the output clear.
+    let body = format!("{target}$ {command}\n\n{out}\n\n{exit}");
 
     if matches!(code, Some(0)) {
         CallToolResult::success(vec![Content::text(body)])
@@ -747,9 +762,11 @@ mod tests {
 
     #[test]
     fn render_output_success() {
-        let r = render_output(b"hello\n", b"", Some(0));
+        let r = render_output("uname -a", "ubuntu", b"hello\n", b"", Some(0));
         assert!(!is_error(&r));
         let text = result_text(&r);
+        // Header echoes the command and target so the UI shows what produced the output.
+        assert!(text.starts_with("ubuntu$ uname -a"), "got {text:?}");
         assert!(text.contains("hello"));
         assert!(text.contains("[exit code: 0]"));
         assert!(!text.contains("[stderr]"));
@@ -757,9 +774,10 @@ mod tests {
 
     #[test]
     fn render_output_nonzero_is_error_with_stderr() {
-        let r = render_output(b"out", b"boom", Some(3));
+        let r = render_output("do-thing", "winvm", b"out", b"boom", Some(3));
         assert!(is_error(&r));
         let text = result_text(&r);
+        assert!(text.starts_with("winvm$ do-thing"), "got {text:?}");
         assert!(text.contains("out"));
         assert!(text.contains("[stderr]"));
         assert!(text.contains("boom"));
@@ -768,13 +786,13 @@ mod tests {
 
     #[test]
     fn render_output_empty_uses_placeholder() {
-        let r = render_output(b"", b"", Some(0));
+        let r = render_output("noop", "ubuntu", b"", b"", Some(0));
         assert!(result_text(&r).contains("(no output)"));
     }
 
     #[test]
     fn render_output_no_exit_code_is_error() {
-        let r = render_output(b"", b"", None);
+        let r = render_output("crash", "ubuntu", b"", b"", None);
         assert!(is_error(&r));
         assert!(result_text(&r).contains("terminated without an exit code"));
     }
