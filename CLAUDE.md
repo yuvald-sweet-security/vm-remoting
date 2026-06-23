@@ -69,14 +69,16 @@ Use the **PowerShell tool** and invoke the script by its bare absolute path — 
 the call operator `&`**:
 
 ```
-D:\claude-remoting\vm.ps1 'hostname'                 # active target — the default
-D:\claude-remoting\vm.ps1 -Target winvm 'hostname'   # only when a specific VM is required
+C:\path\to\vm.ps1 'hostname'                 # active target — the default
+C:\path\to\vm.ps1 -Target winvm 'hostname'   # only when a specific VM is required
 ```
+
+(`C:\path\to\vm.ps1` is wherever `vm.ps1` lives on this machine — see the global config.)
 
 Why no `&`: the permission engine parses the PowerShell AST and matches on the command
 name. A leading `& ` defeats wildcard/prefix matching, so `PowerShell(& ...vm.ps1 *)`
 won't auto-approve and you get a prompt every time. Invoking the bare path lets the rule
-`PowerShell(D:\\claude-remoting\\vm.ps1 *)` match with any arguments.
+for vm.ps1's absolute path (`PowerShell(C:\\path\\to\\vm.ps1 *)`) match with any arguments.
 
 - Run the script as a **single statement** — no trailing `; echo ...` etc. The engine
   splits compound commands on `;` `|` `&&` `||` and requires every segment to be allowed,
@@ -86,8 +88,8 @@ won't auto-approve and you get a prompt every time. Invoking the bare path lets 
 - The guest command runs as a PowerShell command line on `hyperv` targets, and via
   `bash -lc` on `wsl`/`ssh` targets — write it for the target's native shell.
 - Fallback if the `PowerShell` tool is unavailable (only `Bash` present): invoke via
-  `pwsh -NoProfile -File D:/claude-remoting/vm.ps1 -Target <name> '<cmd>'` and allow
-  `Bash(pwsh -NoProfile -File D:/claude-remoting/vm.ps1 *)`.
+  `pwsh -NoProfile -File C:/path/to/vm.ps1 -Target <name> '<cmd>'` and allow
+  `Bash(pwsh -NoProfile -File C:/path/to/vm.ps1 *)`.
 
 ### Subcommands
 
@@ -113,21 +115,22 @@ won't auto-approve and you get a prompt every time. Invoking the bare path lets 
 
 `hyperv` targets need a DPAPI credential file (`Get-Credential | Export-Clixml`),
 decryptable only by the same Windows user + machine that created it. This applies to both
-front-ends — they read the same file. If a target reports a missing credential file, ask
-the user to run (it prompts interactively, which my non-interactive shell can't satisfy):
+front-ends — they read the same file (stored under `%APPDATA%\vm-remoting\.vm-creds\`). If a
+target reports a missing credential file, ask the user to run (it prompts interactively,
+which my non-interactive shell can't satisfy):
 
 ```
-& D:\claude-remoting\vm.ps1 save-cred <name>
+& C:\path\to\vm.ps1 save-cred <name>
 ```
 
 ## Adding a target
 
-Edit `D:\claude-remoting\.vm-targets.json` (used by both the MCP server and `vm.ps1`).
-Shapes:
+Edit the shared config (default `%APPDATA%\vm-remoting\.vm-targets.json`; used by both the
+MCP server and `vm.ps1`). Shapes:
 
 ```json
-"name": { "type": "hyperv", "vmName": "...", "credPath": "D:\\claude-remoting\\.vm-creds\\name.xml" }
-"name": { "type": "ssh",    "host": "...", "user": "...", "key": "D:\\keys\\name.pem", "port": 22, "options": ["StrictHostKeyChecking=accept-new"] }
+"name": { "type": "hyperv", "vmName": "...", "credPath": "<absolute path printed by save-cred>" }
+"name": { "type": "ssh",    "host": "...", "user": "...", "key": "C:\\path\\to\\name.pem", "port": 22, "options": ["StrictHostKeyChecking=accept-new"] }
 "name": { "type": "wsl",    "distro": "Ubuntu", "user": "..." }
 ```
 

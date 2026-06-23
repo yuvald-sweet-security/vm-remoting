@@ -9,12 +9,19 @@
   its output and exit code. No persistent session is required (so it works fine even though
   shell state does not survive between separate invocations).
 
-  Config file (default: <script dir>\.vm-targets.json):
+  Config file resolution (first match wins; matches the vm-remoting MCP server, so both
+  front-ends share one config):
+    1. $env:VM_TARGETS_FILE                     - explicit path to the JSON file
+    2. $env:VM_CONFIG_DIR\.vm-targets.json
+    3. .\.vm-targets.json                       - current directory, if present
+    4. %APPDATA%\vm-remoting\.vm-targets.json   - default (per-user)
+  Hyper-V credentials live in .vm-creds next to the resolved config; save-cred writes them
+  there and prints the absolute credPath to paste in.
     {
       "current": "winvm",
       "targets": {
-        "winvm":  { "type": "hyperv", "vmName": "Win11Dev", "credPath": "D:\\claude-remoting\\.vm-creds\\winvm.xml" },
-        "myec2":  { "type": "ssh",    "host": "1.2.3.4", "user": "ubuntu", "key": "D:\\keys\\ec2.pem" },
+        "winvm":  { "type": "hyperv", "vmName": "Win11Dev", "credPath": "<path printed by save-cred>" },
+        "myec2":  { "type": "ssh",    "host": "1.2.3.4", "user": "ubuntu", "key": "C:\\path\\to\\ec2.pem" },
         "ubuntu": { "type": "wsl",    "distro": "Ubuntu" }
       }
     }

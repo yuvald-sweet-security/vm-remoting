@@ -55,8 +55,8 @@ So after `cargo install`, the zero-config home for your targets is
 {
   "current": "ubuntu",
   "targets": {
-    "winvm":  { "type": "hyperv", "vmName": "Win 11", "credPath": "D:\\path\\to\\winvm.xml" },
-    "ec2":    { "type": "ssh", "host": "1.2.3.4", "user": "ubuntu", "key": "D:\\keys\\ec2.pem", "port": 22, "options": ["StrictHostKeyChecking=accept-new"] },
+    "winvm":  { "type": "hyperv", "vmName": "Win 11", "credPath": "C:\\Users\\you\\AppData\\Roaming\\vm-remoting\\.vm-creds\\winvm.xml" },
+    "ec2":    { "type": "ssh", "host": "1.2.3.4", "user": "ubuntu", "key": "C:\\path\\to\\ec2.pem", "port": 22, "options": ["StrictHostKeyChecking=accept-new"] },
     "ubuntu": { "type": "wsl", "distro": "Ubuntu" }
   }
 }
@@ -72,10 +72,11 @@ A `hyperv` target needs a DPAPI credential file, decryptable only by the same Wi
 machine that created it, and required for non-interactive use:
 
 ```powershell
-& D:\claude-remoting\vm.ps1 save-cred winvm   # prompts, writes the .xml, prints the path
+.\vm.ps1 save-cred winvm   # prompts, writes the .xml to %APPDATA%\vm-remoting\.vm-creds, prints the path
 ```
 
-Then set `"credPath"` on the target. If it's missing, `run_command` returns a clear error.
+Then set `"credPath"` to the absolute path it prints (Windows does not expand `%APPDATA%`
+inside the JSON, so paste the literal path). If it's missing, `run_command` returns a clear error.
 
 ## Register with Claude Code
 
