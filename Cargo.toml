@@ -1,6 +1,6 @@
 [package]
 name = "vm-remoting-mcp"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "MCP server exposing a multi-backend remoting dispatcher (Hyper-V / SSH / WSL) as Model Context Protocol tools"
 license = "MIT"
