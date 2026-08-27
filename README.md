@@ -8,7 +8,7 @@ Two front-ends share that config:
 
 | Front-end | What it is | Use it for |
 |---|---|---|
-| **`vm-remoting-mcp`** | A native Rust [MCP](https://modelcontextprotocol.io) server (`src/main.rs`) exposing `list_targets` and `run_command` tools. | Agents / Claude Code. |
+| **`vm-remoting-mcp`** | A native Rust [MCP](https://modelcontextprotocol.io) server (`src/main.rs`) exposing `list_targets`, `run_command` and background-job tools. | Agents / Claude Code. |
 | **`vm.ps1`** | The original stateless PowerShell dispatcher. | Humans at a terminal. |
 
 The MCP server is a self-contained reimplementation — it does **not** shell out to `vm.ps1`.
@@ -93,13 +93,48 @@ yourself:
 claude mcp add vm-remoting -- vm-remoting-mcp
 ```
 
-The tools then appear as `mcp__vm-remoting__list_targets` and `mcp__vm-remoting__run_command`.
+The tools then appear as `mcp__vm-remoting__list_targets`, `mcp__vm-remoting__run_command`,
+`mcp__vm-remoting__job_list`, `mcp__vm-remoting__job_output` and
+`mcp__vm-remoting__job_stop`.
+
+## Background jobs
+
+A foreground call can't return until the transport's stdout/stderr pipes reach EOF, and a
+process backgrounded *inside the guest* inherits those pipes. So `cmd &` returns in the guest
+while the call keeps blocking for the job's whole lifetime — backgrounding has to happen on
+this side of the transport, which is what `background` does:
+
+```jsonc
+run_command { "command": "cargo build --release", "background": true }
+// -> started background job j1787819910549-0
+job_output  { "job_id": "j1787819910549-0" }
+// -> state: running for 3m12s  +  the tail of stdout/stderr so far
+```
+
+| Tool | Purpose |
+|---|---|
+| `job_list` | Every job (or one target's), with state, runtime, exit code and command. |
+| `job_output` | One job's state plus the last `tail_lines` (default 200; `0` for all) of each stream. |
+| `job_stop` | Stop watching a job and tear down its transport. |
+
+Jobs are children of the server process: they live as long as the MCP session, are private to
+it, and their output is captured in memory (capped at 8 MiB per stream, keeping the tail).
+Finished jobs are dropped from the registry once they age past the retention window.
+
+> **`job_stop` does not reliably kill the guest process.** It kills the local end of the
+> transport; because no PTY is allocated there is no controlling terminal to deliver SIGHUP,
+> so an `ssh`/`hyperv` guest command generally keeps running. The same applies when a
+> foreground call hits `timeout_ms`. To be sure, kill the process in the guest explicitly
+> (`pkill -f ...`, `Stop-Process`) and verify.
 
 ### Environment overrides
 
 | Variable | Effect |
 |---|---|
-| `VM_TARGETS_FILE` | Use this exact config file. |
-| `VM_CONFIG_DIR` | Look for `.vm-targets.json` in this directory. |
-| `VM_PWSH` | PowerShell executable for Hyper-V targets (default `pwsh`). |
+| `VM_TARGETS_FILE` | Use this exact config file. Shared with `vm.ps1`. |
+| `VM_CONFIG_DIR` | Look for `.vm-targets.json` in this directory. Shared with `vm.ps1`. |
+| `VM_REMOTING_PWSH` | PowerShell executable for Hyper-V targets (default `pwsh`). |
+| `VM_REMOTING_SSH` | SSH client for `ssh` targets (default `ssh`). Useful on Windows, where System32's OpenSSH, Git's bundled copy and a Scoop/Cygwin build can all be on `PATH` and behave differently. |
+| `VM_REMOTING_TIMEOUT_MS` | Default foreground timeout in ms (default `600000`); `0` waits forever. |
+| `VM_REMOTING_JOB_TTL_DAYS` | How long finished jobs stay in the registry (default `7`); `0` keeps them for the session. |
 | `RUST_LOG` | Log filter; logs go to **stderr** (stdout is the JSON-RPC channel). |

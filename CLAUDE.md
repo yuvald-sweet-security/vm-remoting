@@ -9,8 +9,8 @@ There are two front-ends, and they share the same `.vm-targets.json` config so t
 interoperate:
 
 1. **`vm-remoting` MCP server** — a native Rust server (`src/main.rs`, binary
-   `vm-remoting-mcp`) exposing `list_targets` and `run_command` tools. **Use this by
-   default.**
+   `vm-remoting-mcp`) exposing `list_targets`, `run_command` and the `job_*` tools. **Use
+   this by default.**
 2. **`vm.ps1`** — the original PowerShell dispatcher. **Fallback only** — use it when the
    `vm-remoting` MCP server is not registered in this session.
 
@@ -22,15 +22,23 @@ interoperate:
 | Tool | Purpose |
 |---|---|
 | `list_targets` | List configured targets; the active one is marked `*`. (≈ `vm.ps1 list`) |
-| `run_command` | Run a command on a target; returns the combined output + exit code. |
+| `run_command` | Run a command on a target; returns the combined output + exit code. Set `background` to start a job instead. |
+| `job_list` | List background jobs (id, target, state, runtime, exit code, command). |
+| `job_output` | Poll one job: its state plus the tail of its output. |
+| `job_stop` | Stop watching a job and tear down its transport. |
 
 `run_command` parameters:
 
 - `command` (required) — the command line, written for the target's **native shell**:
-  PowerShell on `hyperv` targets, `bash -lc` on `ssh`/`wsl` targets.
+  PowerShell on `hyperv` targets, `bash` on `ssh`/`wsl` targets. It is delivered on stdin to
+  `bash -ls` (a login shell), so **the command cannot itself read stdin** — anything
+  interactive must be fed from a file or a heredoc inside the command.
 - `target` (optional) — target name (see `list_targets`). **Omit it to run on the active
   target; that is the default and what you should do for most calls.** Pass it only when the
   request needs a *specific* VM — then the call is self-contained and race-free.
+- `background` (optional) — start a job and return immediately; see below.
+- `timeout_ms` (optional) — give up after this long and report the partial output. Defaults
+  to 10 minutes; `0` waits forever. Ignored when `background` is set.
 
 Behavior to rely on:
 
@@ -47,6 +55,35 @@ Behavior to rely on:
 
 The interactive `use` and `save-cred` subcommands are intentionally **not** exposed by the
 MCP server; they remain human-only via `vm.ps1`.
+
+### Background jobs
+
+**Use `run_command` with `background: true` for anything long-running** — builds, test
+suites, installs. It returns a job id straight away; poll it with `job_output(job_id)`.
+
+Do **not** try to background inside the command itself. `cmd &`, `nohup`, `disown` and
+friends *do not work here*: the call blocks until the transport's output pipes close, and a
+process backgrounded in the guest inherits those pipes, so the call still waits for the whole
+job. Redirecting the job's output helps but is not enough over SSH. `background: true` is the
+only way to express "start this and return".
+
+```
+run_command(command: "cargo build --release", background: true)   -> started background job j1787819910549-0
+job_output(job_id: "j1787819910549-0")                            -> state + tail of the output so far
+```
+
+- `job_output` returns the last 200 lines of each of stdout and stderr; pass `tail_lines` to
+  widen that, or `tail_lines: 0` for the whole log.
+- A job's state is `running`, `exited` or `stopped`. A non-zero exit is a tool *error*, the
+  same as for a foreground call; a still-running or deliberately stopped job is not.
+- `job_list` takes an optional `target` to filter; omit it to see every job.
+- Jobs are children of the MCP server process, so they last as long as the session does and
+  are not visible to other sessions or to `vm.ps1`.
+- **`job_stop` does not reliably kill the guest process.** It kills the local end of the
+  transport; with no PTY there is no controlling terminal to deliver SIGHUP, so the command
+  inside an `ssh`/`hyperv` guest generally keeps running. Same caveat for a foreground
+  `timeout_ms`. If the guest process itself has to die, kill it explicitly (`pkill -f ...`,
+  `Stop-Process`) with `run_command` and verify.
 
 ## Fallback: `vm.ps1` (only when the MCP server is not registered)
 
@@ -85,8 +122,11 @@ for vm.ps1's absolute path (`PowerShell(C:\\path\\to\\vm.ps1 *)`) match with any
   so an appended statement re-triggers the prompt. To get the exit code, run the script
   alone and read `$LASTEXITCODE` on a separate (also-allowed or trivial) line if needed.
 - Wrap the guest command in single quotes.
-- The guest command runs as a PowerShell command line on `hyperv` targets, and via
-  `bash -lc` on `wsl`/`ssh` targets — write it for the target's native shell.
+- The guest command runs as a PowerShell command line on `hyperv` targets, via `bash -lc` on
+  `wsl` targets, and as an argument to `ssh` (so the remote login shell parses it) on `ssh`
+  targets — write it for the target's native shell. Note this differs from the MCP server,
+  which sends the command on stdin to `bash -ls` for both `wsl` and `ssh`.
+- `vm.ps1` has no equivalent of the MCP server's background jobs — it always waits.
 - Fallback if the `PowerShell` tool is unavailable (only `Bash` present): invoke via
   `pwsh -NoProfile -File C:/path/to/vm.ps1 -Target <name> '<cmd>'` and allow
   `Bash(pwsh -NoProfile -File C:/path/to/vm.ps1 *)`.
