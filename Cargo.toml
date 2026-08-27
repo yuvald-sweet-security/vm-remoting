@@ -23,6 +23,7 @@ tokio = { version = "1", features = [
     "process",
     "io-std",
     "io-util",
+    "sync",
     "time",
 ] }
 tracing = "0.1"

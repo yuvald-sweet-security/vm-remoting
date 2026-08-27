@@ -10,6 +10,15 @@
 //!     is the only way into a Hyper-V guest, so this one backend needs PowerShell — the dispatch
 //!     logic itself lives here; the command travels in via `$env:VM_GUEST_CMD`).
 //!
+//! Commands can also run as **background jobs**. A foreground call cannot return until the
+//! transport's stdout/stderr pipes hit EOF, and any process backgrounded inside the guest
+//! inherits those pipes — so `cmd &` returns in the guest while the MCP call still blocks for
+//! the job's full lifetime. Backgrounding therefore has to happen on this side of the
+//! transport: `run_command` with `background` spawns the transport, hands its pipes to reader
+//! tasks and returns a job id immediately, and `job_list` / `job_output` / `job_stop` work
+//! against an in-process registry. Jobs are children of this server, so they live as long as
+//! it does.
+//!
 //! Targets are read from a `.vm-targets.json` file, located via (first match wins):
 //!   1. `VM_TARGETS_FILE`            — explicit path to the JSON file
 //!   2. `VM_CONFIG_DIR`/.vm-targets.json
@@ -28,8 +37,11 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -45,6 +57,7 @@ use serde::Deserialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
+    sync::oneshot,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -53,8 +66,18 @@ use tracing_subscriber::EnvFilter;
 /// otherwise wedge the call forever, since nothing else bounds it.
 const DEFAULT_TIMEOUT_MS: u64 = 600_000;
 
-/// Per-stream cap on captured output. A runaway command can print without bound, and
-/// everything it prints is held in memory until the call returns.
+/// How long a *finished* job is kept in the registry before `job_list` prunes it. Overridable
+/// with `VM_REMOTING_JOB_TTL_DAYS`; `0` disables pruning. Running jobs are never pruned.
+const DEFAULT_JOB_TTL_DAYS: u64 = 7;
+
+/// Lines of stdout/stderr returned per stream by `job_output` when not told otherwise. A
+/// long build's log is far larger than a tool result should be, so the tail is the default
+/// and the full text is opt-in.
+const DEFAULT_TAIL_LINES: u32 = 200;
+
+/// Per-stream cap on captured output, for both foreground calls and jobs. A runaway command
+/// can print without bound, and everything it prints is held in memory until the call
+/// returns (or, for a job, until the job is pruned).
 const MAX_CAPTURE: usize = 8 * 1024 * 1024;
 
 /// Fixed PowerShell program used for Hyper-V targets. All per-call values (VM name, guest
@@ -299,28 +322,37 @@ fn plan_command(progs: &Programs, target: &Target, command: &str) -> CommandPlan
     }
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct RunArgs {
-    /// The command line to run on the target, written for the target's native shell
-    /// (PowerShell for `hyperv` targets, bash for `ssh`/`wsl` targets).
-    command: String,
-    /// Optional target name (see `list_targets`). Omit to run on the configured active
-    /// target — that is the default and preferred for most calls. Set this only when a
-    /// specific VM is required.
-    #[serde(default)]
-    target: Option<String>,
-    /// Give up after this many milliseconds and report whatever the command printed so far.
-    /// Omit for the server default (10 minutes unless `VM_REMOTING_TIMEOUT_MS` says
-    /// otherwise); 0 waits forever.
-    #[serde(default)]
-    timeout_ms: Option<u64>,
+// ---------------------------------------------------------------------------------------
+// Background jobs
+//
+// A foreground call cannot return until the transport's stdout/stderr pipes hit EOF, and a
+// process backgrounded inside the guest inherits those pipes — which is why `cmd &` returns
+// in the guest while the MCP call still blocks for the job's whole lifetime. Backgrounding
+// therefore has to happen on our side of the transport: the server spawns the transport,
+// hands its pipes to reader tasks, and returns a job id instead of awaiting it.
+//
+// Jobs are children of this server process, so they last as long as it does — which is the
+// intent, since the targets are local VMs. A job's captured output lives in memory, capped
+// at MAX_CAPTURE per stream.
+// ---------------------------------------------------------------------------------------
+
+/// Mint a job id. Millisecond timestamp plus a per-process counter — the counter is what
+/// guarantees uniqueness, since several jobs can start within the same millisecond. Display
+/// order comes from the registry's insertion order, not from the id.
+fn new_job_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("j{ms}-{}", SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Output captured from one stream of a running command.
 #[derive(Debug, Default)]
 struct Captured {
     bytes: Vec<u8>,
-    /// Bytes discarded from the front once [`MAX_CAPTURE`] was reached. A long log is more
+    /// Bytes discarded from the front once [`MAX_CAPTURE`] was reached. A build log is more
     /// useful from its end than its start, so the cap keeps the tail.
     dropped: u64,
 }
@@ -334,40 +366,63 @@ impl Captured {
             self.dropped += excess as u64;
         }
     }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).into_owned()
+    }
 }
 
-/// Captured result of one transport invocation.
-struct RunOutput {
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-    code: Option<i32>,
-    /// Set when the call hit its timeout and the transport was killed. `stdout`/`stderr`
-    /// then hold whatever had been printed up to that point.
-    timed_out: bool,
+/// How a job ended, or that it hasn't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobState {
+    Running,
+    /// The command finished on its own. `None` means it was terminated without an exit code.
+    Exited(Option<i32>),
+    /// `job_stop` tore the transport down.
+    Stopped,
 }
 
-/// Read a `u64` setting from the environment, falling back to `default` if it is unset or
-/// unparseable.
-fn env_u64(key: &str, default: u64) -> u64 {
-    env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(default)
-}
-
-/// Copy a child pipe into a shared buffer. This runs as its own task rather than via
-/// `wait_with_output` so that a timeout can still report the output produced before the
-/// command was killed.
-async fn drain<R: AsyncReadExt + Unpin>(mut src: R, sink: Arc<Mutex<Captured>>) {
-    let mut chunk = [0u8; 8192];
-    loop {
-        match src.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => match sink.lock() {
-                Ok(mut buf) => buf.push(&chunk[..n]),
-                Err(_) => break,
-            },
+impl JobState {
+    fn label(&self) -> &'static str {
+        match self {
+            JobState::Running => "running",
+            JobState::Exited(_) => "exited",
+            JobState::Stopped => "stopped",
         }
+    }
+}
+
+/// A background job: the transport process, its captured output, and how to stop it.
+struct Job {
+    id: String,
+    target: String,
+    command: String,
+    started: SystemTime,
+    stdout: Arc<Mutex<Captured>>,
+    stderr: Arc<Mutex<Captured>>,
+    /// Written by the waiter task once the transport exits.
+    outcome: Arc<Mutex<(JobState, Option<SystemTime>)>>,
+    /// Fires the waiter task's kill path. Taken on first use — stopping twice is a no-op.
+    stop: Mutex<Option<oneshot::Sender<()>>>,
+}
+
+impl Job {
+    fn state(&self) -> JobState {
+        self.outcome
+            .lock()
+            .map(|o| o.0)
+            .unwrap_or(JobState::Running)
+    }
+
+    /// How long the job ran, or has been running so far.
+    fn elapsed(&self) -> Duration {
+        let end = self
+            .outcome
+            .lock()
+            .ok()
+            .and_then(|o| o.1)
+            .unwrap_or_else(SystemTime::now);
+        end.duration_since(self.started).unwrap_or_default()
     }
 }
 
@@ -390,12 +445,106 @@ fn fmt_duration(secs: u64) -> String {
     }
 }
 
+/// Keep the last `tail` lines of `text`, reporting `(kept, total)` so the caller can say how
+/// much it elided. `tail` of 0 keeps everything.
+fn tail_lines(text: &str, tail: u32) -> (String, usize, usize) {
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    if tail == 0 || total <= tail as usize {
+        return (text.trim_end_matches('\n').to_string(), total, total);
+    }
+    let kept = &lines[total - tail as usize..];
+    (kept.join("\n"), kept.len(), total)
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct RunArgs {
+    /// The command line to run on the target, written for the target's native shell
+    /// (PowerShell for `hyperv` targets, bash for `ssh`/`wsl` targets).
+    command: String,
+    /// Optional target name (see `list_targets`). Omit to run on the configured active
+    /// target — that is the default and preferred for most calls. Set this only when a
+    /// specific VM is required.
+    #[serde(default)]
+    target: Option<String>,
+    /// Start the command as a detached background job and return its id immediately instead
+    /// of waiting. Use this for anything long-running (builds, test suites, installs):
+    /// backgrounding inside the command itself (`cmd &`, `nohup`) does NOT work — the call
+    /// still blocks until the job finishes. Poll it with `job_output`.
+    #[serde(default)]
+    background: bool,
+    /// Give up after this many milliseconds and report whatever the command printed so far.
+    /// Omit for the server default (10 minutes unless `VM_REMOTING_TIMEOUT_MS` says
+    /// otherwise); 0 waits forever. Ignored when `background` is set.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// Arguments for the tools that address one existing job.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct JobArgs {
+    /// Job id, as returned by `run_command` with `background` or listed by `job_list`.
+    job_id: String,
+    /// How many lines to return from the end of each of stdout and stderr. Defaults to 200;
+    /// 0 returns the entire captured log, which for a long build can be very large.
+    #[serde(default)]
+    tail_lines: Option<u32>,
+}
+
+/// Arguments for `job_list`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct JobListArgs {
+    /// Show only jobs started on this target. Omit to list jobs on every target.
+    #[serde(default)]
+    target: Option<String>,
+}
+
+/// Captured result of one transport invocation.
+struct RunOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    code: Option<i32>,
+    /// Set when the call hit its timeout and the transport was killed. `stdout`/`stderr`
+    /// then hold whatever had been printed up to that point.
+    timed_out: bool,
+}
+
+/// Read a `u64` setting from the environment, falling back to `default` if it is unset or
+/// unparseable.
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Copy a child pipe into a shared buffer. This runs as its own task rather than via
+/// `wait_with_output` so that the output stays reachable while the command is still going —
+/// which is what lets a job be polled, and a timed-out call report what it managed to print.
+async fn drain<R: AsyncReadExt + Unpin>(mut src: R, sink: Arc<Mutex<Captured>>) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match src.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => match sink.lock() {
+                Ok(mut buf) => buf.push(&chunk[..n]),
+                Err(_) => break,
+            },
+        }
+    }
+}
+
 #[derive(Clone)]
 struct VmServer {
     programs: Programs,
     targets_file: PathBuf,
     /// Foreground timeout used when a call does not supply one; 0 means unbounded.
     default_timeout_ms: u64,
+    /// How long a finished job stays in the registry, in seconds; 0 disables pruning.
+    job_ttl_secs: u64,
+    /// Background jobs, newest last. Shared across clones of the handler, which is why the
+    /// registry is behind an `Arc` while everything else here is plain data.
+    jobs: Arc<Mutex<IndexMap<String, Arc<Job>>>>,
     // Consumed by the `#[tool_handler]`-generated routing code; not read directly.
     #[allow(dead_code)]
     tool_router: ToolRouter<VmServer>,
@@ -408,8 +557,28 @@ impl VmServer {
             programs: Programs::from_env(),
             targets_file: targets_file(),
             default_timeout_ms: env_u64("VM_REMOTING_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
+            job_ttl_secs: env_u64("VM_REMOTING_JOB_TTL_DAYS", DEFAULT_JOB_TTL_DAYS)
+                .saturating_mul(86_400),
+            jobs: Arc::new(Mutex::new(IndexMap::new())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Look a job up by id, with an error that lists what *is* there.
+    fn job(&self, id: &str) -> Result<Arc<Job>, McpError> {
+        let jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| McpError::internal_error("job registry poisoned", None))?;
+        jobs.get(id).cloned().ok_or_else(|| {
+            let known: Vec<&str> = jobs.keys().map(String::as_str).collect();
+            let known = if known.is_empty() {
+                "no jobs have been started in this session".to_string()
+            } else {
+                format!("known jobs: {}", known.join(", "))
+            };
+            McpError::invalid_params(format!("unknown job '{id}' ({known})"), None)
+        })
     }
 
     /// Read and parse the targets config. A missing file is treated as "no targets".
@@ -431,6 +600,9 @@ impl VmServer {
 
     /// Spawn the transport for `target` with the guest command already delivered, and start
     /// tasks draining its stdout and stderr into `stdout`/`stderr`.
+    ///
+    /// Shared by the foreground and background paths: the only difference between them is
+    /// who waits for the returned child.
     async fn spawn_transport(
         &self,
         target: &Target,
@@ -470,7 +642,8 @@ impl VmServer {
         } else {
             Stdio::null()
         });
-        // Without this a timed-out transport would be left running after we stop waiting.
+        // Without this a transport we stop waiting on — timed out, or stopped — would be
+        // left running.
         cmd.kill_on_drop(true);
 
         let mut child = cmd.spawn().map_err(|e| {
@@ -509,8 +682,8 @@ impl VmServer {
     ///
     /// `timeout_ms` of 0 waits indefinitely. Otherwise the transport process is killed once
     /// the bound elapses and whatever it had printed is returned with `timed_out` set — note
-    /// that this tears down the *local* end only. With no PTY there is no controlling
-    /// terminal to deliver SIGHUP, so the command inside the guest usually keeps running.
+    /// that this tears down the *local* end only, so a guest process may keep running after
+    /// a foreground timeout. Background jobs are the better way to run something long.
     async fn run_on(
         &self,
         target: &Target,
@@ -557,6 +730,83 @@ impl VmServer {
         })
     }
 
+    /// Start `command` on `target` as a background job and return its id without waiting.
+    ///
+    /// A waiter task owns the child from here on; it records the outcome when the transport
+    /// exits, or kills it if `job_stop` signals first. Giving the waiter sole ownership is
+    /// what keeps stopping a job free of any pid handling or platform-specific kill code.
+    async fn start_job(
+        &self,
+        target: &Target,
+        target_name: &str,
+        command: &str,
+    ) -> Result<String, McpError> {
+        let stdout = Arc::new(Mutex::new(Captured::default()));
+        let stderr = Arc::new(Mutex::new(Captured::default()));
+        let child = self
+            .spawn_transport(target, command, Arc::clone(&stdout), Arc::clone(&stderr))
+            .await?;
+
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let outcome = Arc::new(Mutex::new((JobState::Running, None)));
+        let job = Arc::new(Job {
+            id: new_job_id(),
+            target: target_name.to_string(),
+            command: command.to_string(),
+            started: SystemTime::now(),
+            stdout,
+            stderr,
+            outcome: Arc::clone(&outcome),
+            stop: Mutex::new(Some(stop_tx)),
+        });
+
+        tokio::spawn(async move {
+            let mut child = child;
+            let state = tokio::select! {
+                status = child.wait() => JobState::Exited(status.ok().and_then(|s| s.code())),
+                _ = stop_rx => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    JobState::Stopped
+                }
+            };
+            if let Ok(mut slot) = outcome.lock() {
+                *slot = (state, Some(SystemTime::now()));
+            }
+        });
+
+        let id = job.id.clone();
+        self.jobs
+            .lock()
+            .map_err(|_| McpError::internal_error("job registry poisoned", None))?
+            .insert(id.clone(), job);
+        Ok(id)
+    }
+
+    /// Resolve a tool's optional `target` argument to a named target, falling back to the
+    /// configured active one.
+    fn resolve<'a>(
+        &self,
+        cfg: &'a Config,
+        requested: Option<&str>,
+    ) -> Result<(String, &'a Target), McpError> {
+        let name = match requested {
+            Some(t) => t.to_string(),
+            None => cfg.current.clone().ok_or_else(|| {
+                McpError::invalid_params(
+                    "no target given and no active target is configured; pass `target` or set a \
+                     `current` target in .vm-targets.json",
+                    None,
+                )
+            })?,
+        };
+        let target = cfg.targets.get(&name).ok_or_else(|| {
+            let known = cfg.targets.keys().cloned().collect::<Vec<_>>().join(", ");
+            McpError::invalid_params(format!("unknown target '{name}'. Known: {known}"), None)
+        })?;
+        Ok((name, target))
+    }
+
     #[tool(
         description = "List the configured remoting targets (Hyper-V VMs, SSH/EC2 hosts, WSL \
                        distros). The active target — used by run_command when no target is given \
@@ -579,29 +829,28 @@ impl VmServer {
         description = "Run a command on a remoting target and return its combined output and exit \
                        code. Defaults to the configured active target; pass `target` only when a \
                        specific VM is required. The command runs as a PowerShell command line on \
-                       hyperv targets and via `bash -lc` on ssh/wsl targets."
+                       hyperv targets and on stdin to `bash -ls` (a login shell, so the command \
+                       cannot itself read stdin) on ssh/wsl targets. Set `background` for \
+                       anything long-running — builds, test suites, installs — to get a job id \
+                       back immediately instead of waiting; trying to background inside the \
+                       command (`cmd &`, `nohup`) does not work, because the call blocks until \
+                       the guest closes the transport's output pipes."
     )]
     async fn run_command(
         &self,
         Parameters(args): Parameters<RunArgs>,
     ) -> Result<CallToolResult, McpError> {
         let cfg = self.load_config()?;
+        let (name, target) = self.resolve(&cfg, args.target.as_deref())?;
 
-        let name = match &args.target {
-            Some(t) => t.clone(),
-            None => cfg.current.clone().ok_or_else(|| {
-                McpError::invalid_params(
-                    "no target given and no active target is configured; pass `target` or set a \
-                     `current` target in .vm-targets.json",
-                    None,
-                )
-            })?,
-        };
-
-        let target = cfg.targets.get(&name).ok_or_else(|| {
-            let known = cfg.targets.keys().cloned().collect::<Vec<_>>().join(", ");
-            McpError::invalid_params(format!("unknown target '{name}'. Known: {known}"), None)
-        })?;
+        if args.background {
+            let id = self.start_job(target, &name, &args.command).await?;
+            return Ok(CallToolResult::success(vec![Content::text(format!(
+                "{name}$ {}\n\nstarted background job {id}\n\nPoll it with job_output(job_id: \
+                 \"{id}\"); stop it with job_stop. Its output is captured as it runs.",
+                args.command
+            ))]));
+        }
 
         let timeout_ms = args.timeout_ms.unwrap_or(self.default_timeout_ms);
         let out = self.run_on(target, &args.command, timeout_ms).await?;
@@ -613,6 +862,93 @@ impl VmServer {
             out.code,
             out.timed_out.then_some(timeout_ms),
         ))
+    }
+
+    #[tool(
+        description = "List background jobs started in this session, newest first, with each \
+                       job's target, state (running/exited/stopped), runtime, exit code and \
+                       command. Pass `target` to list only one target's jobs. Also drops finished \
+                       jobs older than VM_REMOTING_JOB_TTL_DAYS days (7 by default) from the \
+                       registry; running jobs are never dropped."
+    )]
+    async fn job_list(
+        &self,
+        Parameters(args): Parameters<JobListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut jobs = self
+            .jobs
+            .lock()
+            .map_err(|_| McpError::internal_error("job registry poisoned", None))?;
+
+        let before = jobs.len();
+        if self.job_ttl_secs > 0 {
+            let ttl = Duration::from_secs(self.job_ttl_secs);
+            jobs.retain(|_, j| match j.outcome.lock().ok().and_then(|o| o.1) {
+                Some(finished) => finished.elapsed().unwrap_or_default() < ttl,
+                None => true,
+            });
+        }
+        let pruned = before - jobs.len();
+
+        let rows: Vec<Arc<Job>> = jobs
+            .values()
+            .rev()
+            .filter(|j| args.target.as_ref().is_none_or(|t| &j.target == t))
+            .cloned()
+            .collect();
+        drop(jobs);
+
+        Ok(CallToolResult::success(vec![Content::text(
+            render_job_list(&rows, args.target.as_deref(), pruned),
+        )]))
+    }
+
+    #[tool(
+        description = "Show a background job's current state and the tail of its output. This is \
+                       how you poll a job started with run_command(background). Returns the last \
+                       200 lines of each of stdout and stderr by default — raise or zero \
+                       `tail_lines` for more."
+    )]
+    async fn job_output(
+        &self,
+        Parameters(args): Parameters<JobArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let job = self.job(&args.job_id)?;
+        Ok(render_job_detail(
+            &job,
+            args.tail_lines.unwrap_or(DEFAULT_TAIL_LINES),
+        ))
+    }
+
+    #[tool(
+        description = "Stop watching a background job and tear down its transport process. Output \
+                       captured up to that point stays readable with job_output. IMPORTANT: this \
+                       kills the local end of the connection, which does NOT reliably kill the \
+                       command inside the guest — with no PTY there is no controlling terminal to \
+                       deliver SIGHUP, so an ssh/hyperv guest process usually keeps running. If \
+                       the guest process itself must die, kill it with run_command (e.g. `pkill \
+                       -f <pattern>`) and verify."
+    )]
+    async fn job_stop(
+        &self,
+        Parameters(args): Parameters<JobArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let job = self.job(&args.job_id)?;
+        let signalled = job
+            .stop
+            .lock()
+            .ok()
+            .and_then(|mut s| s.take())
+            .is_some_and(|tx: oneshot::Sender<()>| tx.send(()).is_ok());
+
+        // The waiter task needs a moment to reap the child and record the outcome, so the
+        // state we then report is the settled one rather than a stale "running".
+        if signalled {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        Ok(CallToolResult::success(vec![Content::text(
+            render_job_stop(&job, signalled),
+        )]))
     }
 }
 
@@ -666,8 +1002,8 @@ fn render_output(
 
     let exit = match (timed_out, code) {
         (Some(ms), _) => format!(
-            "[timed out after {}; the transport was killed, but the command inside the guest may \
-             still be running]",
+            "[timed out after {}; the transport was killed, but a guest process may still be \
+             running. Re-run with run_command(background) for anything this long.]",
             fmt_duration(ms / 1_000)
         ),
         (None, Some(c)) => format!("[exit code: {c}]"),
@@ -681,6 +1017,151 @@ fn render_output(
     } else {
         CallToolResult::error(vec![Content::text(body)])
     }
+}
+
+/// Render `job_list` as an aligned table. `rows` is already newest-first and filtered;
+/// `filter` names the target it was filtered to, if any. Pruned jobs are reported in a
+/// footer so the drop is never silent.
+fn render_job_list(rows: &[Arc<Job>], filter: Option<&str>, pruned: usize) -> String {
+    let scope = match filter {
+        Some(t) => format!("{t}$ jobs"),
+        None => "jobs".to_string(),
+    };
+    let mut body = format!("{scope}\n\n");
+
+    if rows.is_empty() {
+        body.push_str("No background jobs.\n");
+    } else {
+        let width = |f: &dyn Fn(&Job) -> usize, header: usize| {
+            rows.iter().map(|j| f(j)).max().unwrap_or(0).max(header)
+        };
+        let idw = width(&|j| j.id.len(), 2);
+        let tw = width(&|j| j.target.len(), 6);
+        body.push_str(&format!(
+            "{:<idw$}  {:<tw$}  {:<7}  {:>8}  {:>4}  {}\n",
+            "ID", "TARGET", "STATE", "RUNTIME", "EXIT", "COMMAND"
+        ));
+        for j in rows {
+            let state = j.state();
+            let exit = match state {
+                JobState::Exited(Some(c)) => c.to_string(),
+                _ => "-".to_string(),
+            };
+            body.push_str(&format!(
+                "{:<idw$}  {:<tw$}  {:<7}  {:>8}  {:>4}  {}\n",
+                j.id,
+                j.target,
+                state.label(),
+                fmt_duration(j.elapsed().as_secs()),
+                exit,
+                j.command.lines().next().unwrap_or("")
+            ));
+        }
+    }
+
+    if pruned > 0 {
+        body.push_str(&format!(
+            "\n(dropped {pruned} finished job{} past the retention window)\n",
+            if pruned == 1 { "" } else { "s" }
+        ));
+    }
+    body.push_str("\nRead one with job_output(job_id).");
+    body
+}
+
+/// Render one job's state and captured output, mirroring [`render_output`]'s shape so a
+/// finished job reads much like a foreground run. Only a genuinely bad outcome — a non-zero
+/// or missing exit code — is flagged as a tool error; a still-running job and a job the
+/// caller deliberately stopped are not failures.
+fn render_job_detail(job: &Job, tail: u32) -> CallToolResult {
+    let state = job.state();
+    let elapsed = fmt_duration(job.elapsed().as_secs());
+    let mut body = format!(
+        "{}$ [job {}] {}\n\n",
+        job.target,
+        job.id,
+        job.command.trim_end().replace('\n', "\n    ")
+    );
+    body.push_str(&match state {
+        JobState::Running => format!("state: running for {elapsed}\n"),
+        JobState::Exited(_) => format!("state: exited after {elapsed}\n"),
+        JobState::Stopped => format!("state: stopped by job_stop after {elapsed}\n"),
+    });
+
+    let section = |name: &str, captured: &Mutex<Captured>| {
+        let Ok(c) = captured.lock() else {
+            return String::new();
+        };
+        let text = c.text();
+        if text.trim().is_empty() {
+            return String::new();
+        }
+        let (shown, kept, total) = tail_lines(&text, tail);
+        let mut head = if kept < total {
+            format!("\n[{name}] last {kept} of {total} lines\n")
+        } else {
+            format!("\n[{name}]\n")
+        };
+        if c.dropped > 0 {
+            head = format!(
+                "\n[{name}] last {kept} lines; {} KiB from the start of this stream were \
+                 discarded at the capture cap\n",
+                c.dropped / 1024
+            );
+        }
+        format!("{head}{shown}\n")
+    };
+    let out = section("stdout", &job.stdout);
+    let err = section("stderr", &job.stderr);
+    if out.is_empty() && err.is_empty() {
+        body.push_str("\n(no output yet)\n");
+    } else {
+        body.push_str(&out);
+        body.push_str(&err);
+    }
+
+    body.push_str(&match state {
+        JobState::Exited(Some(c)) => format!("\n[exit code: {c}]"),
+        JobState::Exited(None) => "\n[terminated without an exit code]".to_string(),
+        JobState::Stopped => "\n[stopped]".to_string(),
+        JobState::Running => "\n[still running; poll job_output again for more]".to_string(),
+    });
+
+    if matches!(state, JobState::Exited(c) if c != Some(0)) {
+        CallToolResult::error(vec![Content::text(body)])
+    } else {
+        CallToolResult::success(vec![Content::text(body)])
+    }
+}
+
+/// Render `job_stop`'s reply. `signalled` is false when the job had already finished, so
+/// there was nothing left to kill.
+fn render_job_stop(job: &Job, signalled: bool) -> String {
+    let outcome = if signalled {
+        format!(
+            "job {} stopped after {}",
+            job.id,
+            fmt_duration(job.elapsed().as_secs())
+        )
+    } else {
+        match job.state() {
+            JobState::Exited(Some(c)) => format!(
+                "job {} had already finished on its own (exit code: {c}); nothing to stop",
+                job.id
+            ),
+            _ => format!("job {} was already {}", job.id, job.state().label()),
+        }
+    };
+    let caveat = if signalled {
+        " The transport is gone, but the command inside the guest may still be running — kill it \
+         with run_command if that matters."
+    } else {
+        ""
+    };
+    format!(
+        "{}$ job_stop {}\n\n{outcome}\n\nIts output is still readable with job_output.{caveat}",
+        job.target, job.id
+    )
 }
 
 #[tool_handler]
@@ -865,35 +1346,6 @@ mod tests {
             pwsh: pwsh.into(),
             ssh: ssh.into(),
         }
-    }
-
-    #[test]
-    fn ssh_program_is_overridable() {
-        // Windows has several ssh.exe on PATH; VM_REMOTING_SSH picks one without touching
-        // the config.
-        let t = Target::Ssh {
-            host: "h".into(),
-            user: None,
-            key: None,
-            port: None,
-            options: vec![],
-        };
-        let plan = plan_command(
-            &progs("pwsh", r"C:\Windows\System32\OpenSSH\ssh.exe"),
-            &t,
-            "id",
-        );
-        assert_eq!(plan.program, r"C:\Windows\System32\OpenSSH\ssh.exe");
-    }
-
-    #[test]
-    fn wsl_program_is_not_affected_by_the_ssh_override() {
-        let t = Target::Wsl {
-            distro: None,
-            user: None,
-        };
-        let plan = plan_command(&progs("pwsh", "other-ssh"), &t, "id");
-        assert_eq!(plan.program, "wsl.exe");
     }
 
     #[test]
@@ -1103,6 +1555,40 @@ mod tests {
         assert!(is_error(&r));
     }
 
+    // ---- background jobs ---------------------------------------------------
+
+    /// A job that has run for exactly `ran_for` seconds. `started`/`finished` are derived
+    /// from one another so the rendered duration is exact rather than a hair under.
+    fn job_with(state: JobState, ran_for: u64, stdout: &str) -> Job {
+        let ran_for = Duration::from_secs(ran_for);
+        let started = SystemTime::now() - ran_for;
+        let finished = match state {
+            JobState::Running => None,
+            _ => Some(started + ran_for),
+        };
+        let mut out = Captured::default();
+        out.push(stdout.as_bytes());
+        Job {
+            id: "j100-0".into(),
+            target: "ubuntu".into(),
+            command: "cargo build --release".into(),
+            started,
+            stdout: Arc::new(Mutex::new(out)),
+            stderr: Arc::new(Mutex::new(Captured::default())),
+            outcome: Arc::new(Mutex::new((state, finished))),
+            stop: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn job_ids_are_unique_within_a_millisecond() {
+        // The timestamp alone is not enough: a burst of starts lands in the same
+        // millisecond, so the counter is what keeps ids distinct.
+        let ids: Vec<String> = (0..1000).map(|_| new_job_id()).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "job ids must not collide");
+    }
+
     #[test]
     fn captured_keeps_the_tail_once_it_hits_the_cap() {
         let mut c = Captured::default();
@@ -1110,10 +1596,17 @@ mod tests {
         c.push(b"the end");
         assert_eq!(c.bytes.len(), MAX_CAPTURE);
         assert_eq!(c.dropped, 7);
-        assert!(
-            String::from_utf8_lossy(&c.bytes).ends_with("the end"),
-            "the tail must survive"
-        );
+        assert!(c.text().ends_with("the end"), "the tail must survive");
+    }
+
+    #[test]
+    fn tail_lines_trims_to_the_last_n() {
+        let text = "1\n2\n3\n4\n5\n";
+        assert_eq!(tail_lines(text, 2), ("4\n5".to_string(), 2, 5));
+        // Asking for more than there is, or for everything, returns everything.
+        assert_eq!(tail_lines(text, 99), ("1\n2\n3\n4\n5".to_string(), 5, 5));
+        assert_eq!(tail_lines(text, 0), ("1\n2\n3\n4\n5".to_string(), 5, 5));
+        assert_eq!(tail_lines("", 5), (String::new(), 0, 0));
     }
 
     #[test]
@@ -1123,6 +1616,130 @@ mod tests {
         assert_eq!(fmt_duration(192), "3m12s");
         assert_eq!(fmt_duration(3_840), "1h04m");
         assert_eq!(fmt_duration(183_600), "2d03h");
+    }
+
+    #[test]
+    fn render_job_detail_running_is_not_an_error() {
+        let job = job_with(JobState::Running, 192, "Compiling serde\n");
+        let r = render_job_detail(&job, 200);
+        assert!(!is_error(&r), "a job still in flight has not failed");
+        let text = result_text(&r);
+        assert!(text.starts_with("ubuntu$ [job j100-0] cargo build --release"));
+        assert!(text.contains("state: running for 3m12s"), "got {text:?}");
+        assert!(text.contains("Compiling serde"));
+        assert!(text.contains("[still running"));
+    }
+
+    #[test]
+    fn render_job_detail_reports_exit_code_and_flags_failure() {
+        let ok = render_job_detail(&job_with(JobState::Exited(Some(0)), 10, "done\n"), 200);
+        assert!(!is_error(&ok));
+        assert!(result_text(&ok).contains("[exit code: 0]"));
+
+        let bad = render_job_detail(&job_with(JobState::Exited(Some(101)), 10, "boom\n"), 200);
+        assert!(is_error(&bad));
+        assert!(result_text(&bad).contains("[exit code: 101]"));
+    }
+
+    #[test]
+    fn render_job_detail_stopped_is_not_an_error() {
+        // The caller asked for the stop, so it is an outcome, not a failure.
+        let r = render_job_detail(&job_with(JobState::Stopped, 30, "partial\n"), 200);
+        assert!(!is_error(&r));
+        let text = result_text(&r);
+        assert!(
+            text.contains("stopped by job_stop after 30s"),
+            "got {text:?}"
+        );
+        assert!(
+            text.contains("partial"),
+            "output before the stop must survive"
+        );
+    }
+
+    #[test]
+    fn render_job_detail_notes_elided_lines() {
+        let many: String = (1..=500).map(|i| format!("line {i}\n")).collect();
+        let text = result_text(&render_job_detail(
+            &job_with(JobState::Running, 5, &many),
+            3,
+        ));
+        assert!(text.contains("last 3 of 500 lines"), "got {text:?}");
+        assert!(text.contains("line 500") && !text.contains("line 1\n"));
+    }
+
+    #[test]
+    fn render_job_detail_without_output_says_so() {
+        let text = result_text(&render_job_detail(&job_with(JobState::Running, 1, ""), 200));
+        assert!(text.contains("(no output yet)"));
+    }
+
+    #[test]
+    fn render_job_list_tabulates_and_reports_pruning() {
+        let jobs = vec![
+            Arc::new(job_with(JobState::Running, 192, "")),
+            Arc::new(job_with(JobState::Exited(Some(2)), 61, "")),
+        ];
+        let text = render_job_list(&jobs, None, 3);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.iter().any(|l| l.starts_with("ID")));
+        assert!(text.contains("running"), "got {text}");
+        assert!(text.contains("3m12s") && text.contains("1m01s"));
+        // A finished job shows its code; a running one has none to show.
+        assert!(text.contains("exited"));
+        // Pruning is reported rather than done silently.
+        assert!(text.contains("dropped 3 finished jobs"), "got {text}");
+    }
+
+    #[test]
+    fn render_job_list_empty_and_filtered() {
+        assert!(render_job_list(&[], None, 0).contains("No background jobs."));
+        let filtered = render_job_list(&[], Some("winvm"), 0);
+        assert!(filtered.starts_with("winvm$ jobs"), "got {filtered}");
+    }
+
+    #[test]
+    fn render_job_stop_distinguishes_killed_from_already_finished() {
+        let killed = render_job_stop(&job_with(JobState::Stopped, 30, ""), true);
+        assert!(killed.contains("stopped after 30s"), "got {killed}");
+
+        let already = render_job_stop(&job_with(JobState::Exited(Some(0)), 5, ""), false);
+        assert!(
+            already.contains("already finished on its own"),
+            "got {already}"
+        );
+        assert!(already.contains("exit code: 0"));
+    }
+
+    // ---- program overrides -------------------------------------------------
+
+    #[test]
+    fn ssh_program_is_overridable() {
+        // Windows has several ssh.exe on PATH; VM_REMOTING_SSH picks one without touching
+        // the config.
+        let t = Target::Ssh {
+            host: "h".into(),
+            user: None,
+            key: None,
+            port: None,
+            options: vec![],
+        };
+        let plan = plan_command(
+            &progs("pwsh", r"C:\Windows\System32\OpenSSH\ssh.exe"),
+            &t,
+            "id",
+        );
+        assert_eq!(plan.program, r"C:\Windows\System32\OpenSSH\ssh.exe");
+    }
+
+    #[test]
+    fn wsl_program_is_not_affected_by_the_ssh_override() {
+        let t = Target::Wsl {
+            distro: None,
+            user: None,
+        };
+        let plan = plan_command(&progs("pwsh", "other-ssh"), &t, "id");
+        assert_eq!(plan.program, "wsl.exe");
     }
 
     // ---- targets-file precedence -------------------------------------------
