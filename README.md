@@ -138,3 +138,51 @@ Finished jobs are dropped from the registry once they age past the retention win
 | `VM_REMOTING_TIMEOUT_MS` | Default foreground timeout in ms (default `600000`); `0` waits forever. |
 | `VM_REMOTING_JOB_TTL_DAYS` | How long finished jobs stay in the registry (default `7`); `0` keeps them for the session. |
 | `RUST_LOG` | Log filter; logs go to **stderr** (stdout is the JSON-RPC channel). |
+
+### Windows: hosts that sanitize the environment
+
+Some MCP hosts do not hand the server the user's environment. Claude Code in the desktop
+app launches it with a sanitized allowlist of roughly sixteen variables — `APPDATA`,
+`HOMEDRIVE`, `HOMEPATH`, `LOCALAPPDATA`, `LOGONSERVER`, `PATH`,
+`PROCESSOR_ARCHITECTURE`, `PROGRAMFILES`, `SYSTEMDRIVE`, `SYSTEMROOT`, `TEMP`,
+`USERDOMAIN`, `USERNAME`, `USERPROFILE`, `WINDIR` — plus whatever the host's own config
+sets. Everything else is dropped, including variables that Windows tooling reads
+implicitly. Children of this server inherit that reduced environment, so both transports
+break, each in a way that points nowhere near the real cause:
+
+| Missing variable | Target type | Symptom |
+|---|---|---|
+| `ProgramData` | `ssh` | `ssh` exits **255 with no output at all**, even under `-vvv`. Win32-OpenSSH resolves its `__PROGRAMDATA__` system config (`%ProgramData%\ssh\ssh_config`) from this variable and dies before it can report anything. |
+| `COMPUTERNAME` | `hyperv` | `Get-VM: Value cannot be null. (Parameter 'name')`. `Get-VM` defaults `-ComputerName` to `$env:COMPUTERNAME`; the null `name` is the **computer** name, not the VM name. `VM_VMNAME` arrives intact. |
+
+Neither symptom implicates the environment, and the Hyper-V one actively misdirects — it
+reads as a bad or missing `vmName` in `.vm-targets.json`. Confirm before you go hunting:
+if `list_targets` prints the right `vmName` but `run_command` reports a null `name`, the
+config is fine and the environment is not.
+
+The fix is to set the variables explicitly in the host's per-server `env` block. For
+Claude Code / Claude Desktop:
+
+```json
+"vm-remoting": {
+  "type": "stdio",
+  "command": "vm-remoting-mcp",
+  "args": [],
+  "env": {
+    "ProgramData": "C:\\ProgramData",
+    "ALLUSERSPROFILE": "C:\\ProgramData",
+    "COMPUTERNAME": "YOUR-HOSTNAME",
+    "VM_REMOTING_SSH": "C:\\Windows\\System32\\OpenSSH\\ssh.exe"
+  }
+}
+```
+
+Hardcode literal values here. `${VAR}` expansion in host config is resolved against the
+host's environment, which is the one already missing these variables.
+
+Two traps when verifying a fix. The server is spawned once at session start, so an edit
+needs a restart to take effect — and a restart can leave the previous
+`vm-remoting-mcp.exe` processes alive and still serving calls, so check with
+`Get-Process vm-remoting-mcp` and quit the host fully if several are listed. Procmon is
+the fastest way to see the truth: it shows the child's full command line, working
+directory and environment block, which settles in one capture what the exit codes cannot.
