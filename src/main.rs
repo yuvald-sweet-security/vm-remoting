@@ -28,6 +28,8 @@ use std::{
     env,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use anyhow::Result;
@@ -40,8 +42,20 @@ use rmcp::{
     transport::stdio,
 };
 use serde::Deserialize;
-use tokio::{io::AsyncWriteExt, process::Command};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+};
 use tracing_subscriber::EnvFilter;
+
+/// Foreground timeout applied when a call does not pass one. Overridable with
+/// `VM_REMOTING_TIMEOUT_MS`; `0` disables the bound entirely. A hung guest command would
+/// otherwise wedge the call forever, since nothing else bounds it.
+const DEFAULT_TIMEOUT_MS: u64 = 600_000;
+
+/// Per-stream cap on captured output. A runaway command can print without bound, and
+/// everything it prints is held in memory until the call returns.
+const MAX_CAPTURE: usize = 8 * 1024 * 1024;
 
 /// Fixed PowerShell program used for Hyper-V targets. All per-call values (VM name, guest
 /// command, credential path) are passed via environment variables, never interpolated into
@@ -295,12 +309,93 @@ struct RunArgs {
     /// specific VM is required.
     #[serde(default)]
     target: Option<String>,
+    /// Give up after this many milliseconds and report whatever the command printed so far.
+    /// Omit for the server default (10 minutes unless `VM_REMOTING_TIMEOUT_MS` says
+    /// otherwise); 0 waits forever.
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// Output captured from one stream of a running command.
+#[derive(Debug, Default)]
+struct Captured {
+    bytes: Vec<u8>,
+    /// Bytes discarded from the front once [`MAX_CAPTURE`] was reached. A long log is more
+    /// useful from its end than its start, so the cap keeps the tail.
+    dropped: u64,
+}
+
+impl Captured {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend_from_slice(chunk);
+        if self.bytes.len() > MAX_CAPTURE {
+            let excess = self.bytes.len() - MAX_CAPTURE;
+            self.bytes.drain(..excess);
+            self.dropped += excess as u64;
+        }
+    }
+}
+
+/// Captured result of one transport invocation.
+struct RunOutput {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    code: Option<i32>,
+    /// Set when the call hit its timeout and the transport was killed. `stdout`/`stderr`
+    /// then hold whatever had been printed up to that point.
+    timed_out: bool,
+}
+
+/// Read a `u64` setting from the environment, falling back to `default` if it is unset or
+/// unparseable.
+fn env_u64(key: &str, default: u64) -> u64 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(default)
+}
+
+/// Copy a child pipe into a shared buffer. This runs as its own task rather than via
+/// `wait_with_output` so that a timeout can still report the output produced before the
+/// command was killed.
+async fn drain<R: AsyncReadExt + Unpin>(mut src: R, sink: Arc<Mutex<Captured>>) {
+    let mut chunk = [0u8; 8192];
+    loop {
+        match src.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => match sink.lock() {
+                Ok(mut buf) => buf.push(&chunk[..n]),
+                Err(_) => break,
+            },
+        }
+    }
+}
+
+/// Compact, human-scale duration: `45s`, `3m12s`, `1h04m`, `2d03h`.
+fn fmt_duration(secs: u64) -> String {
+    let (d, h, m, s) = (
+        secs / 86_400,
+        (secs % 86_400) / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60,
+    );
+    if d > 0 {
+        format!("{d}d{h:02}h")
+    } else if h > 0 {
+        format!("{h}h{m:02}m")
+    } else if m > 0 {
+        format!("{m}m{s:02}s")
+    } else {
+        format!("{s}s")
+    }
 }
 
 #[derive(Clone)]
 struct VmServer {
     programs: Programs,
     targets_file: PathBuf,
+    /// Foreground timeout used when a call does not supply one; 0 means unbounded.
+    default_timeout_ms: u64,
     // Consumed by the `#[tool_handler]`-generated routing code; not read directly.
     #[allow(dead_code)]
     tool_router: ToolRouter<VmServer>,
@@ -312,6 +407,7 @@ impl VmServer {
         Self {
             programs: Programs::from_env(),
             targets_file: targets_file(),
+            default_timeout_ms: env_u64("VM_REMOTING_TIMEOUT_MS", DEFAULT_TIMEOUT_MS),
             tool_router: Self::tool_router(),
         }
     }
@@ -333,13 +429,15 @@ impl VmServer {
         }
     }
 
-    /// Build the transport command for `target`, run it, and capture its output. The native
-    /// exit code propagates as the process exit code.
-    async fn run_on(
+    /// Spawn the transport for `target` with the guest command already delivered, and start
+    /// tasks draining its stdout and stderr into `stdout`/`stderr`.
+    async fn spawn_transport(
         &self,
         target: &Target,
         command: &str,
-    ) -> Result<std::process::Output, McpError> {
+        stdout: Arc<Mutex<Captured>>,
+        stderr: Arc<Mutex<Captured>>,
+    ) -> Result<tokio::process::Child, McpError> {
         // Hyper-V is unusable non-interactively without its DPAPI credential file; fail with
         // a clear message rather than letting `Invoke-Command` block/error opaquely.
         if let Target::Hyperv {
@@ -372,11 +470,12 @@ impl VmServer {
         } else {
             Stdio::null()
         });
+        // Without this a timed-out transport would be left running after we stop waiting.
+        cmd.kill_on_drop(true);
 
-        let launch_err = |e: std::io::Error| {
+        let mut child = cmd.spawn().map_err(|e| {
             McpError::internal_error(format!("failed to launch '{}': {e}", plan.program), None)
-        };
-        let mut child = cmd.spawn().map_err(launch_err)?;
+        })?;
 
         // Feed the guest command over stdin (wsl/ssh), then close it so `bash -ls` hits EOF
         // and runs. The payload is tiny, so writing it before draining output can't deadlock.
@@ -394,7 +493,68 @@ impl VmServer {
             drop(child_stdin);
         }
 
-        child.wait_with_output().await.map_err(launch_err)
+        tokio::spawn(drain(
+            child.stdout.take().expect("stdout was piped"),
+            stdout,
+        ));
+        tokio::spawn(drain(
+            child.stderr.take().expect("stderr was piped"),
+            stderr,
+        ));
+        Ok(child)
+    }
+
+    /// Run `command` on `target` and wait for it. The native exit code propagates as the
+    /// process exit code.
+    ///
+    /// `timeout_ms` of 0 waits indefinitely. Otherwise the transport process is killed once
+    /// the bound elapses and whatever it had printed is returned with `timed_out` set — note
+    /// that this tears down the *local* end only. With no PTY there is no controlling
+    /// terminal to deliver SIGHUP, so the command inside the guest usually keeps running.
+    async fn run_on(
+        &self,
+        target: &Target,
+        command: &str,
+        timeout_ms: u64,
+    ) -> Result<RunOutput, McpError> {
+        let out_buf = Arc::new(Mutex::new(Captured::default()));
+        let err_buf = Arc::new(Mutex::new(Captured::default()));
+        let mut child = self
+            .spawn_transport(target, command, Arc::clone(&out_buf), Arc::clone(&err_buf))
+            .await?;
+
+        let wait_err =
+            |e: std::io::Error| McpError::internal_error(format!("transport failed: {e}"), None);
+        let mut status = None;
+        let mut timed_out = false;
+        if timeout_ms == 0 {
+            status = Some(child.wait().await.map_err(wait_err)?);
+        } else {
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+                Ok(st) => status = Some(st.map_err(wait_err)?),
+                Err(_) => timed_out = true,
+            }
+        }
+        if timed_out {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+        }
+
+        // The child has exited, so its pipes are closed and the drains have either finished
+        // or are about to; yielding lets them flush the last chunk before we read the buffers.
+        tokio::task::yield_now().await;
+        let take = |b: &Arc<Mutex<Captured>>| {
+            b.lock()
+                .map(|mut c| std::mem::take(&mut c.bytes))
+                .unwrap_or_default()
+        };
+
+        Ok(RunOutput {
+            stdout: take(&out_buf),
+            stderr: take(&err_buf),
+            code: status.and_then(|s| s.code()),
+            timed_out,
+        })
     }
 
     #[tool(
@@ -443,13 +603,15 @@ impl VmServer {
             McpError::invalid_params(format!("unknown target '{name}'. Known: {known}"), None)
         })?;
 
-        let out = self.run_on(target, &args.command).await?;
+        let timeout_ms = args.timeout_ms.unwrap_or(self.default_timeout_ms);
+        let out = self.run_on(target, &args.command, timeout_ms).await?;
         Ok(render_output(
             &args.command,
             &name,
             &out.stdout,
             &out.stderr,
-            out.status.code(),
+            out.code,
+            out.timed_out.then_some(timeout_ms),
         ))
     }
 }
@@ -473,12 +635,16 @@ fn render_list(cfg: &Config) -> String {
 /// echoing the command and the target it ran on (so the UI shows what produced the output),
 /// followed by the combined stdout/stderr and a trailing exit-code line. A non-zero (or
 /// absent) exit is surfaced as a tool error so the caller notices failures.
+///
+/// `timed_out` carries the bound that was exceeded, if any; the output is then whatever the
+/// command printed before it was cut off.
 fn render_output(
     command: &str,
     target: &str,
     stdout: &[u8],
     stderr: &[u8],
     code: Option<i32>,
+    timed_out: Option<u64>,
 ) -> CallToolResult {
     let stdout = String::from_utf8_lossy(stdout);
     let stderr = String::from_utf8_lossy(stderr);
@@ -498,14 +664,19 @@ fn render_output(
         out.push_str("(no output)");
     }
 
-    let exit = match code {
-        Some(c) => format!("[exit code: {c}]"),
-        None => "[terminated without an exit code]".to_string(),
+    let exit = match (timed_out, code) {
+        (Some(ms), _) => format!(
+            "[timed out after {}; the transport was killed, but the command inside the guest may \
+             still be running]",
+            fmt_duration(ms / 1_000)
+        ),
+        (None, Some(c)) => format!("[exit code: {c}]"),
+        (None, None) => "[terminated without an exit code]".to_string(),
     };
     // `target$ command` reads like a shell prompt, making the origin of the output clear.
     let body = format!("{target}$ {command}\n\n{out}\n\n{exit}");
 
-    if matches!(code, Some(0)) {
+    if timed_out.is_none() && matches!(code, Some(0)) {
         CallToolResult::success(vec![Content::text(body)])
     } else {
         CallToolResult::error(vec![Content::text(body)])
@@ -877,7 +1048,7 @@ mod tests {
 
     #[test]
     fn render_output_success() {
-        let r = render_output("uname -a", "ubuntu", b"hello\n", b"", Some(0));
+        let r = render_output("uname -a", "ubuntu", b"hello\n", b"", Some(0), None);
         assert!(!is_error(&r));
         let text = result_text(&r);
         // Header echoes the command and target so the UI shows what produced the output.
@@ -889,7 +1060,7 @@ mod tests {
 
     #[test]
     fn render_output_nonzero_is_error_with_stderr() {
-        let r = render_output("do-thing", "winvm", b"out", b"boom", Some(3));
+        let r = render_output("do-thing", "winvm", b"out", b"boom", Some(3), None);
         assert!(is_error(&r));
         let text = result_text(&r);
         assert!(text.starts_with("winvm$ do-thing"), "got {text:?}");
@@ -901,15 +1072,57 @@ mod tests {
 
     #[test]
     fn render_output_empty_uses_placeholder() {
-        let r = render_output("noop", "ubuntu", b"", b"", Some(0));
+        let r = render_output("noop", "ubuntu", b"", b"", Some(0), None);
         assert!(result_text(&r).contains("(no output)"));
     }
 
     #[test]
     fn render_output_no_exit_code_is_error() {
-        let r = render_output("crash", "ubuntu", b"", b"", None);
+        let r = render_output("crash", "ubuntu", b"", b"", None, None);
         assert!(is_error(&r));
         assert!(result_text(&r).contains("terminated without an exit code"));
+    }
+
+    #[test]
+    fn render_output_timeout_keeps_partial_output_and_errors() {
+        // The point of capturing into buffers rather than `wait_with_output`: a command that
+        // is cut off still reports what it printed first.
+        let r = render_output("slow", "ubuntu", b"partial\n", b"", None, Some(90_000));
+        assert!(is_error(&r));
+        let text = result_text(&r);
+        assert!(text.contains("partial"));
+        assert!(text.contains("timed out after 1m30s"), "got {text:?}");
+        assert!(!text.contains("[exit code"));
+    }
+
+    #[test]
+    fn render_output_timeout_beats_a_zero_exit_code() {
+        // A killed transport can still report status 0 on some platforms; the timeout must
+        // win, or a cut-off command would be rendered as a clean success.
+        let r = render_output("slow", "ubuntu", b"", b"", Some(0), Some(1_000));
+        assert!(is_error(&r));
+    }
+
+    #[test]
+    fn captured_keeps_the_tail_once_it_hits_the_cap() {
+        let mut c = Captured::default();
+        c.push(&vec![b'a'; MAX_CAPTURE]);
+        c.push(b"the end");
+        assert_eq!(c.bytes.len(), MAX_CAPTURE);
+        assert_eq!(c.dropped, 7);
+        assert!(
+            String::from_utf8_lossy(&c.bytes).ends_with("the end"),
+            "the tail must survive"
+        );
+    }
+
+    #[test]
+    fn fmt_duration_scales_by_magnitude() {
+        assert_eq!(fmt_duration(0), "0s");
+        assert_eq!(fmt_duration(45), "45s");
+        assert_eq!(fmt_duration(192), "3m12s");
+        assert_eq!(fmt_duration(3_840), "1h04m");
+        assert_eq!(fmt_duration(183_600), "2d03h");
     }
 
     // ---- targets-file precedence -------------------------------------------
