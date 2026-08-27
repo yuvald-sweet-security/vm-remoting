@@ -44,6 +44,22 @@ Behavior to rely on:
 
 - **Output**: combined stdout + stderr, followed by an `[exit code: N]` line. A non-zero or
   missing exit code is surfaced as a tool *error*, so failures are visible.
+- **Exit codes on `hyperv` targets: a PowerShell `exit N` in the command is swallowed.** The
+  command runs inside `Invoke-Command -ScriptBlock`, so `exit` unwinds the script block
+  without setting the reported status. Native-process exit codes *do* propagate via
+  `$LASTEXITCODE`:
+
+  | command on a `hyperv` target | reported |
+  |---|---|
+  | `"before"; exit 7` | `[exit code: 0]` — wrong |
+  | `Write-Error "an error"; exit 7` | `[exit code: 1]` — from the error, not the `exit` |
+  | `cmd /c "exit 9"` | `[exit code: 9]` — correct |
+
+  This matters because a PowerShell build/test script that signals failure with `exit 1`
+  reports **success**. Don't trust the exit code of a `.ps1` you invoke on a `hyperv`
+  target — have the command echo a sentinel (`if (-not $ok) { "FAILED" }`) and check the
+  output, or end it with an explicit `cmd /c "exit $code"`. `bash` targets are unaffected:
+  `exit 42` there is reported faithfully.
 - **Active target**: the `current` pointer in `.vm-targets.json` is global shared state set
   by the human. You can't (and shouldn't) change it through the MCP server — the `use`
   subcommand is deliberately not exposed. Just omit `target` to run on it.
@@ -79,11 +95,21 @@ job_output(job_id: "j1787819910549-0")                            -> state + tai
 - `job_list` takes an optional `target` to filter; omit it to see every job.
 - Jobs are children of the MCP server process, so they last as long as the session does and
   are not visible to other sessions or to `vm.ps1`.
-- **`job_stop` does not reliably kill the guest process.** It kills the local end of the
-  transport; with no PTY there is no controlling terminal to deliver SIGHUP, so the command
-  inside an `ssh`/`hyperv` guest generally keeps running. Same caveat for a foreground
-  `timeout_ms`. If the guest process itself has to die, kill it explicitly (`pkill -f ...`,
-  `Stop-Process`) with `run_command` and verify.
+- **A foreground `timeout_ms` orphans the guest process; `job_stop` is the safer of the two.**
+  Both tear down the local end of the transport, but they don't behave the same in the guest:
+  - `timeout_ms` **leaks**. Observed on an `ssh` target: `sleep 25; touch /tmp/marker` run
+    with `timeout_ms: 3000` still created the marker 25s later — the command ran to
+    completion after the call had already returned "timed out". So a timed-out call is *not*
+    a cancelled call.
+  - `job_stop` on the same target **did** take the guest command down (no process left after
+    stopping a `for i in $(seq 1 60); do ...; sleep 1; done` loop). Its tool description
+    warns the opposite; treat that warning as the worst case, not the norm.
+
+  Neither is guaranteed — with no PTY there is no controlling terminal to deliver SIGHUP, so
+  the outcome depends on the transport and on whether the command holds the output pipes. If
+  the guest process actually has to die, kill it explicitly (`pkill -f ...`, `Stop-Process`)
+  with `run_command` and verify. Prefer `background: true` + `job_stop` over a short
+  `timeout_ms` for anything whose side effects you'd have to undo.
 
 ## Fallback: `vm.ps1` (only when the MCP server is not registered)
 
