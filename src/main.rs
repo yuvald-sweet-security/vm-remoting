@@ -105,6 +105,27 @@ impl Target {
     }
 }
 
+/// External programs the server drives, so each can be repointed without touching the code.
+/// `ssh` in particular is ambiguous on Windows — System32's OpenSSH, Git's bundled copy and
+/// a Scoop/Cygwin build can all be on `PATH`, and they differ in config handling and
+/// `ProxyCommand` support.
+#[derive(Debug, Clone)]
+struct Programs {
+    /// PowerShell executable used for `hyperv` targets only. `VM_REMOTING_PWSH`.
+    pwsh: String,
+    /// SSH client used for `ssh` targets. `VM_REMOTING_SSH`.
+    ssh: String,
+}
+
+impl Programs {
+    fn from_env() -> Self {
+        Self {
+            pwsh: env::var("VM_REMOTING_PWSH").unwrap_or_else(|_| "pwsh".to_string()),
+            ssh: env::var("VM_REMOTING_SSH").unwrap_or_else(|_| "ssh".to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct Config {
     #[serde(default)]
@@ -180,16 +201,16 @@ struct CommandPlan {
     stdin: Option<String>,
 }
 
-/// Decide how to invoke `command` on `target`. `pwsh` is the PowerShell executable used for
-/// Hyper-V targets. This performs no I/O — see [`VmServer::run_on`] for the credential
-/// preflight and the actual spawn.
+/// Decide how to invoke `command` on `target`, using the executables named by `progs`. This
+/// performs no I/O — see [`VmServer::run_on`] for the credential preflight and the actual
+/// spawn.
 ///
 /// For `wsl`/`ssh` the guest command is delivered over stdin to `bash -ls` (a login shell
 /// reading from stdin) rather than as an argv element. Passing it as an argument means it
 /// survives two rounds of quoting (Rust's Windows command-line encoding, then `wsl.exe`/
 /// `ssh.exe`'s own parsing), which corrupts quotes — e.g. single-quoted text gets expanded.
 /// stdin sidesteps all of that. Hyper-V already avoids the problem via environment variables.
-fn plan_command(pwsh: &str, target: &Target, command: &str) -> CommandPlan {
+fn plan_command(progs: &Programs, target: &Target, command: &str) -> CommandPlan {
     match target {
         Target::Wsl { distro, user } => {
             let mut args = Vec::new();
@@ -239,14 +260,14 @@ fn plan_command(pwsh: &str, target: &Target, command: &str) -> CommandPlan {
             args.push("bash".into());
             args.push("-ls".into());
             CommandPlan {
-                program: "ssh".into(),
+                program: progs.ssh.clone(),
                 args,
                 env: Vec::new(),
                 stdin: Some(command.to_string()),
             }
         }
         Target::Hyperv { vm_name, cred_path } => CommandPlan {
-            program: pwsh.to_string(),
+            program: progs.pwsh.clone(),
             args: vec![
                 "-NoProfile".into(),
                 "-NonInteractive".into(),
@@ -278,8 +299,7 @@ struct RunArgs {
 
 #[derive(Clone)]
 struct VmServer {
-    /// PowerShell executable used for `hyperv` targets only. Overridable with `VM_PWSH`.
-    pwsh: String,
+    programs: Programs,
     targets_file: PathBuf,
     // Consumed by the `#[tool_handler]`-generated routing code; not read directly.
     #[allow(dead_code)]
@@ -290,7 +310,7 @@ struct VmServer {
 impl VmServer {
     fn new() -> Self {
         Self {
-            pwsh: env::var("VM_PWSH").unwrap_or_else(|_| "pwsh".to_string()),
+            programs: Programs::from_env(),
             targets_file: targets_file(),
             tool_router: Self::tool_router(),
         }
@@ -337,7 +357,7 @@ impl VmServer {
             ));
         }
 
-        let plan = plan_command(&self.pwsh, target, command);
+        let plan = plan_command(&self.programs, target, command);
         let mut cmd = Command::new(&plan.program);
         cmd.args(&plan.args);
         for (key, value) in &plan.env {
@@ -669,13 +689,49 @@ mod tests {
         plan.args.iter().map(String::as_str).collect()
     }
 
+    fn progs(pwsh: &str, ssh: &str) -> Programs {
+        Programs {
+            pwsh: pwsh.into(),
+            ssh: ssh.into(),
+        }
+    }
+
+    #[test]
+    fn ssh_program_is_overridable() {
+        // Windows has several ssh.exe on PATH; VM_REMOTING_SSH picks one without touching
+        // the config.
+        let t = Target::Ssh {
+            host: "h".into(),
+            user: None,
+            key: None,
+            port: None,
+            options: vec![],
+        };
+        let plan = plan_command(
+            &progs("pwsh", r"C:\Windows\System32\OpenSSH\ssh.exe"),
+            &t,
+            "id",
+        );
+        assert_eq!(plan.program, r"C:\Windows\System32\OpenSSH\ssh.exe");
+    }
+
+    #[test]
+    fn wsl_program_is_not_affected_by_the_ssh_override() {
+        let t = Target::Wsl {
+            distro: None,
+            user: None,
+        };
+        let plan = plan_command(&progs("pwsh", "other-ssh"), &t, "id");
+        assert_eq!(plan.program, "wsl.exe");
+    }
+
     #[test]
     fn plan_wsl_with_distro_and_user() {
         let t = Target::Wsl {
             distro: Some("Ubuntu-Claude".into()),
             user: Some("dev".into()),
         };
-        let plan = plan_command("pwsh", &t, "uname -a");
+        let plan = plan_command(&progs("pwsh", "ssh"), &t, "uname -a");
         assert_eq!(plan.program, "wsl.exe");
         // Command goes over stdin, not the argv (avoids wsl.exe quote mangling).
         assert_eq!(
@@ -692,7 +748,7 @@ mod tests {
             distro: None,
             user: None,
         };
-        let plan = plan_command("pwsh", &t, "echo hi");
+        let plan = plan_command(&progs("pwsh", "ssh"), &t, "echo hi");
         assert_eq!(args_of(&plan), ["--", "bash", "-ls"]);
         assert_eq!(plan.stdin.as_deref(), Some("echo hi"));
     }
@@ -706,7 +762,7 @@ mod tests {
             port: Some(2222),
             options: vec!["StrictHostKeyChecking=accept-new".into()],
         };
-        let plan = plan_command("pwsh", &t, "ls -la");
+        let plan = plan_command(&progs("pwsh", "ssh"), &t, "ls -la");
         assert_eq!(plan.program, "ssh");
         assert_eq!(
             args_of(&plan),
@@ -736,7 +792,7 @@ mod tests {
             port: None,
             options: vec![],
         };
-        let plan = plan_command("pwsh", &t, "whoami");
+        let plan = plan_command(&progs("pwsh", "ssh"), &t, "whoami");
         assert_eq!(
             args_of(&plan),
             ["-o", "BatchMode=yes", "host", "bash", "-ls"]
@@ -753,7 +809,7 @@ mod tests {
             user: None,
         };
         let tricky = "echo 'literal $HOME' \"$(id -u)\"";
-        let plan = plan_command("pwsh", &t, tricky);
+        let plan = plan_command(&progs("pwsh", "ssh"), &t, tricky);
         assert!(
             !plan
                 .args
@@ -769,7 +825,7 @@ mod tests {
             vm_name: "Win 11".into(),
             cred_path: Some("c.xml".into()),
         };
-        let plan = plan_command("pwsh-7", &t, "whoami");
+        let plan = plan_command(&progs("pwsh-7", "ssh"), &t, "whoami");
         assert_eq!(plan.program, "pwsh-7");
         assert_eq!(
             args_of(&plan),
@@ -796,7 +852,7 @@ mod tests {
             vm_name: "VM".into(),
             cred_path: None,
         };
-        let plan = plan_command("pwsh", &t, "hostname");
+        let plan = plan_command(&progs("pwsh", "ssh"), &t, "hostname");
         assert_eq!(
             plan.env.last(),
             Some(&("VM_CREDPATH".to_string(), None)),
