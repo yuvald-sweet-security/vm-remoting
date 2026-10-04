@@ -38,6 +38,12 @@ self-contained — no repo checkout or `vm.ps1` needed at runtime.
 > `publish = false` in `Cargo.toml` blocks `cargo publish` (crates.io); `--path` and
 > `--git` installs work regardless. Remove that line if you want to publish.
 
+On Windows, **configure `COMPUTERNAME` in the MCP server's environment before using
+Hyper-V targets**. Hyper-V requires the host computer name; MCP hosts may omit it
+from their default environment. Use Codex's `env_vars` passthrough below, or set the
+literal value in Claude's `env` block. See [Windows environment requirements](#windows-hosts-that-sanitize-the-environment)
+for the additional variables needed by Windows OpenSSH.
+
 ## Configure targets
 
 The server reads the same `.vm-targets.json` as `vm.ps1`. It is located by, first match wins:
@@ -96,6 +102,26 @@ claude mcp add vm-remoting -- vm-remoting-mcp
 The tools then appear as `mcp__vm-remoting__list_targets`, `mcp__vm-remoting__run_command`,
 `mcp__vm-remoting__job_list`, `mcp__vm-remoting__job_output` and
 `mcp__vm-remoting__job_stop`.
+
+## Register with Codex
+
+Add or update the server entry in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.vm-remoting]
+command = "vm-remoting-mcp"
+env_vars = ["COMPUTERNAME"]
+```
+
+`env_vars` passes the named variables from Codex's environment into the MCP server;
+it does not set a literal value. On Windows, `COMPUTERNAME` must contain the **host**
+computer name, not the guest VM name. If the entry already has `env_vars`, append
+`"COMPUTERNAME"` to the existing list. For Windows OpenSSH, also pass `"ProgramData"`
+and `"ALLUSERSPROFILE"` as described below.
+
+After saving the config, reload the MCP connection or restart Codex after active
+background jobs finish. Existing server processes retain their original environment.
+See the [Codex MCP configuration documentation](https://developers.openai.com/codex/mcp).
 
 ## Background jobs
 
@@ -160,8 +186,8 @@ reads as a bad or missing `vmName` in `.vm-targets.json`. Confirm before you go 
 if `list_targets` prints the right `vmName` but `run_command` reports a null `name`, the
 config is fine and the environment is not.
 
-The fix is to set the variables explicitly in the host's per-server `env` block. For
-Claude Code / Claude Desktop:
+Set the variables explicitly in the MCP configuration: use `env_vars` for Codex
+passthrough (see above), or the per-server `env` block for Claude Code / Claude Desktop:
 
 ```json
 "vm-remoting": {
