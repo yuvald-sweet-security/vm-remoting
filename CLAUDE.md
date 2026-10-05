@@ -1,11 +1,11 @@
 # Remoting to a VM / EC2 / WSL — guidance for Claude
 
 This repo provides a stateless remoting dispatcher that runs a command on a configured
-remote target (Hyper-V VM via PowerShell Direct, SSH host / EC2, or WSL distro) and streams
+remote target (Hyper-V VM, Windows guest in VMware Fusion, SSH host / EC2, or WSL distro) and streams
 the output back. Use it for any "run X on the VM / EC2 / WSL" request instead of raw
 `Invoke-Command -VMName`, `ssh`, or `wsl`.
 
-There are two front-ends, and they share the same `.vm-targets.json` config so they
+There are three front-ends, and they share the same `.vm-targets.json` config so they
 interoperate:
 
 1. **`vm-remoting` MCP server** — a native Rust server (`src/main.rs`, binary
@@ -30,7 +30,7 @@ interoperate:
 `run_command` parameters:
 
 - `command` (required) — the command line, written for the target's **native shell**:
-  PowerShell on `hyperv` targets, `bash` on `ssh`/`wsl` targets. It is delivered on stdin to
+  PowerShell on `hyperv`/`fusion` targets, `bash` on `ssh`/`wsl` targets. It is delivered on stdin to
   `bash -ls` (a login shell), so **the command cannot itself read stdin** — anything
   interactive must be fed from a file or a heredoc inside the command.
 - `target` (optional) — target name (see `list_targets`). **Omit it to run on the active
@@ -188,6 +188,29 @@ which my non-interactive shell can't satisfy):
 ```
 & C:\path\to\vm.ps1 save-cred <name>
 ```
+
+## Bash fallback and Fusion targets
+
+`vm.sh` is the Bash fallback when MCP is unavailable. It shares the config and uses the
+Rust binary (`VM_REMOTING_MCP`, PATH, or a local build):
+
+```bash
+/absolute/path/to/vm.sh list
+/absolute/path/to/vm.sh --target fusion-win 'hostname; whoami'
+```
+
+`vm.sh use` and `save-cred` remain human-only operations. Fusion targets run Windows
+PowerShell through VMware Tools using Fusion's `vmrun`. The VM must be running with Tools
+installed. Put passwords directly in the config; omit `vmPassword` for unencrypted VMs:
+
+```json
+"fusion-win": { "type": "fusion", "vmxPath": "/path/Windows.vmwarevm/Windows.vmx", "user": "user", "password": "GUEST-PASSWORD", "vmPassword": "VM-ENCRYPTION-PASSWORD" }
+```
+
+`VM_REMOTING_VMRUN` overrides the Fusion
+executable path. Explicit PowerShell exits and native exit codes propagate. Output files
+are copied back during execution. Timeout/job-stop can leave the guest command running
+and temporary files behind; normal completion cleans them up.
 
 ## Adding a target
 

@@ -1,6 +1,13 @@
 {
   "current": "ubuntu",
   "targets": {
+    "fusion-win": {
+      "type": "fusion",
+      "vmxPath": "/Users/you/Virtual Machines.localized/Windows.vmwarevm/Windows.vmx",
+      "user": "user",
+      "password": "GUEST-PASSWORD",
+      "vmPassword": "VM-ENCRYPTION-PASSWORD"
+    },
     "winvm": {
       "type": "hyperv",
       "vmName": "Windows 11",
