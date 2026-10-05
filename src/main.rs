@@ -9,6 +9,8 @@
 //!   * `hyperv` → `pwsh` running `Invoke-Command -VMName ... [-Credential ...]` (PowerShell Direct
 //!     is the only way into a Hyper-V guest, so this one backend needs PowerShell — the dispatch
 //!     logic itself lives here; the command travels in via `$env:VM_GUEST_CMD`).
+//!   * `fusion` → a child worker using Fusion's `vmrun` and VMware Tools to transfer a
+//!     PowerShell script and poll its output files and exit status.
 //!
 //! Commands can also run as **background jobs**. A foreground call cannot return until the
 //! transport's stdout/stderr pipes hit EOF, and any process backgrounded inside the guest
@@ -53,13 +55,15 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::oneshot,
 };
 use tracing_subscriber::EnvFilter;
+
+mod fusion;
 
 /// Foreground timeout applied when a call does not pass one. Overridable with
 /// `VM_REMOTING_TIMEOUT_MS`; `0` disables the bound entirely. A hung guest command would
@@ -103,9 +107,13 @@ exit $script:code
 "#;
 
 /// A single remoting target, as stored in `.vm-targets.json`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Target {
+    Fusion {
+        #[serde(flatten)]
+        config: fusion::FusionTarget,
+    },
     Hyperv {
         #[serde(rename = "vmName")]
         vm_name: String,
@@ -135,6 +143,7 @@ impl Target {
     /// `(kind, label)` for the `list_targets` display.
     fn summary(&self) -> (&'static str, &str) {
         match self {
+            Target::Fusion { config } => ("fusion", &config.vmx_path),
             Target::Hyperv { vm_name, .. } => ("hyperv", vm_name),
             Target::Ssh { host, .. } => ("ssh", host),
             Target::Wsl { distro, .. } => ("wsl", distro.as_deref().unwrap_or("(default)")),
@@ -148,6 +157,7 @@ impl Target {
 /// `ProxyCommand` support.
 #[derive(Debug, Clone)]
 struct Programs {
+    worker: String,
     /// PowerShell executable used for `hyperv` targets only. `VM_REMOTING_PWSH`.
     pwsh: String,
     /// SSH client used for `ssh` targets. `VM_REMOTING_SSH`.
@@ -157,13 +167,17 @@ struct Programs {
 impl Programs {
     fn from_env() -> Self {
         Self {
+            worker: env::current_exe()
+                .expect("server executable path")
+                .to_string_lossy()
+                .into_owned(),
             pwsh: env::var("VM_REMOTING_PWSH").unwrap_or_else(|_| "pwsh".to_string()),
             ssh: env::var("VM_REMOTING_SSH").unwrap_or_else(|_| "ssh".to_string()),
         }
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct Config {
     #[serde(default)]
     current: Option<String>,
@@ -249,6 +263,15 @@ struct CommandPlan {
 /// stdin sidesteps all of that. Hyper-V already avoids the problem via environment variables.
 fn plan_command(progs: &Programs, target: &Target, command: &str) -> CommandPlan {
     match target {
+        Target::Fusion { config } => CommandPlan {
+            program: progs.worker.clone(),
+            args: vec!["--fusion-worker".into()],
+            env: vec![(
+                "VM_FUSION_TARGET".into(),
+                Some(serde_json::to_string(config).expect("serializable Fusion target")),
+            )],
+            stdin: Some(command.to_string()),
+        },
         Target::Wsl { distro, user } => {
             let mut args = Vec::new();
             if let Some(d) = distro {
@@ -460,7 +483,7 @@ fn tail_lines(text: &str, tail: u32) -> (String, usize, usize) {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RunArgs {
     /// The command line to run on the target, written for the target's native shell
-    /// (PowerShell for `hyperv` targets, bash for `ssh`/`wsl` targets).
+    /// (PowerShell for `hyperv`/`fusion` targets, bash for `ssh`/`wsl` targets).
     command: String,
     /// Optional target name (see `list_targets`). Omit to run on the configured active
     /// target — that is the default and preferred for most calls. Set this only when a
@@ -808,7 +831,7 @@ impl VmServer {
     }
 
     #[tool(
-        description = "List the configured remoting targets (Hyper-V VMs, SSH/EC2 hosts, WSL \
+        description = "List the configured remoting targets (Hyper-V and Fusion VMs, SSH/EC2 hosts, WSL \
                        distros). The active target — used by run_command when no target is given \
                        — is marked with '*'."
     )]
@@ -829,7 +852,7 @@ impl VmServer {
         description = "Run a command on a remoting target and return its combined output and exit \
                        code. Defaults to the configured active target; pass `target` only when a \
                        specific VM is required. The command runs as a PowerShell command line on \
-                       hyperv targets and on stdin to `bash -ls` (a login shell, so the command \
+                       hyperv/fusion targets and on stdin to `bash -ls` (a login shell, so the command \
                        cannot itself read stdin) on ssh/wsl targets. Set `background` for \
                        anything long-running — builds, test suites, installs — to get a job id \
                        back immediately instead of waiting; trying to background inside the \
@@ -1184,6 +1207,12 @@ impl ServerHandler for VmServer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("--fusion-worker") {
+        let config: fusion::FusionTarget = serde_json::from_str(&env::var("VM_FUSION_TARGET")?)?;
+        let mut command = String::new();
+        tokio::io::stdin().read_to_string(&mut command).await?;
+        std::process::exit(fusion::run(&config, &command).await?);
+    }
     // All logging MUST go to stderr — stdout is the JSON-RPC channel for the stdio transport.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1343,9 +1372,27 @@ mod tests {
 
     fn progs(pwsh: &str, ssh: &str) -> Programs {
         Programs {
+            worker: "vm-remoting-mcp".into(),
             pwsh: pwsh.into(),
             ssh: ssh.into(),
         }
+    }
+
+    #[test]
+    fn fusion_config_and_plan_keep_command_off_argv() {
+        let cfg: Config = serde_json::from_str(r#"{"targets":{"win":{"type":"fusion","vmxPath":"/VMs/Windows dev.vmx","user":"user","password":"guest-secret","vmPassword":"vm-secret"}}}"#).unwrap();
+        let target = &cfg.targets["win"];
+        assert_eq!(target.summary(), ("fusion", "/VMs/Windows dev.vmx"));
+        let command = "Write-Output 'héllo $HOME'; exit 7";
+        let plan = plan_command(&progs("pwsh", "ssh"), target, command);
+        assert_eq!(args_of(&plan), ["--fusion-worker"]);
+        assert_eq!(plan.stdin.as_deref(), Some(command));
+        let env = plan.env[0].1.as_ref().unwrap();
+        assert!(env.contains("vm-secret"));
+        assert!(!env.contains(command));
+        let roundtrip: Config =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(roundtrip.targets["win"].summary(), target.summary());
     }
 
     #[test]
