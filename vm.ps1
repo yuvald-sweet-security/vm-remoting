@@ -97,6 +97,17 @@ function Get-TargetDef($cfg, $name) {
 
 function Invoke-OnTarget($def, [string]$commandLine) {
     switch ($def.type) {
+        'fusion' {
+            $previous = $env:VM_FUSION_TARGET
+            try {
+                $env:VM_FUSION_TARGET = $def | ConvertTo-Json -Depth 10 -Compress
+                $worker = if ($env:VM_REMOTING_MCP) { $env:VM_REMOTING_MCP } else { 'vm-remoting-mcp' }
+                $commandLine | & $worker --fusion-worker
+                $script:TargetExit = $LASTEXITCODE
+            } finally {
+                $env:VM_FUSION_TARGET = $previous
+            }
+        }
         'hyperv' {
             $params = @{ VMName = $def.vmName }
             if ($def.credPath) {
@@ -153,7 +164,7 @@ switch ($first) {
         $cfg.targets.PSObject.Properties | ForEach-Object {
             $marker = if ($_.Name -eq $cfg.current) { '*' } else { ' ' }
             "{0} {1,-12} {2,-7} {3}" -f $marker, $_.Name, $_.Value.type,
-                ($_.Value.vmName ?? $_.Value.host ?? $_.Value.distro)
+                ($_.Value.vmName ?? $_.Value.vmxPath ?? $_.Value.host ?? $_.Value.distro)
         }
         break
     }

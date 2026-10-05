@@ -46,7 +46,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -1207,6 +1207,9 @@ impl ServerHandler for VmServer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("--cli") {
+        std::process::exit(run_cli(env::args().skip(2).collect()).await?);
+    }
     if env::args().nth(1).as_deref() == Some("--fusion-worker") {
         let config: fusion::FusionTarget = serde_json::from_str(&env::var("VM_FUSION_TARGET")?)?;
         let mut command = String::new();
@@ -1231,6 +1234,88 @@ async fn main() -> Result<()> {
 
     service.waiting().await?;
     Ok(())
+}
+
+async fn run_cli(mut args: Vec<String>) -> Result<i32> {
+    let server = VmServer::new();
+    let mut config = server.load_config().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let requested = if args
+        .first()
+        .is_some_and(|s| s == "--target" || s == "-Target")
+    {
+        if args.len() < 3 {
+            anyhow::bail!("usage: vm.sh --target <name> <command>");
+        }
+        args.remove(0);
+        Some(args.remove(0))
+    } else {
+        None
+    };
+    match args.first().map(String::as_str) {
+        None => {
+            println!(
+                "Usage: vm.sh [--target <name>] <command> | list | use <name> | save-cred <name>"
+            );
+            return Ok(0);
+        }
+        Some("list") if requested.is_none() => {
+            println!("{}", render_list(&config));
+            return Ok(0);
+        }
+        Some("use") if requested.is_none() => {
+            if args.len() != 2 {
+                anyhow::bail!("usage: vm.sh use <name>");
+            }
+            server
+                .resolve(&config, Some(&args[1]))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            config.current = Some(args[1].clone());
+            let parent = server
+                .targets_file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            let mut file = tempfile::NamedTempFile::new_in(parent)?;
+            std::io::Write::write_all(
+                &mut file,
+                serde_json::to_string_pretty(&config)?.as_bytes(),
+            )?;
+            file.persist(&server.targets_file)?;
+            println!("Active target -> {}", args[1]);
+            return Ok(0);
+        }
+        _ => {}
+    }
+    let (_, target) = server
+        .resolve(&config, requested.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let plan = plan_command(&server.programs, target, &args.join(" "));
+    let mut transport = Command::new(&plan.program);
+    transport
+        .args(&plan.args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    for (key, value) in &plan.env {
+        match value {
+            Some(value) => transport.env(key, value),
+            None => transport.env_remove(key),
+        };
+    }
+    transport.stdin(if plan.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = transport
+        .spawn()
+        .with_context(|| format!("failed to launch '{}'", plan.program))?;
+    if let Some(input) = plan.stdin {
+        let mut stdin = child.stdin.take().expect("piped command input");
+        stdin.write_all(format!("{input}\n").as_bytes()).await?;
+    }
+    Ok(child.wait().await?.code().unwrap_or(1))
 }
 
 #[cfg(test)]
