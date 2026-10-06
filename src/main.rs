@@ -1465,7 +1465,7 @@ mod tests {
 
     #[test]
     fn fusion_config_and_plan_keep_command_off_argv() {
-        let cfg: Config = serde_json::from_str(r#"{"targets":{"win":{"type":"fusion","vmxPath":"/VMs/Windows dev.vmx","user":"user","password":"guest-secret","vmPassword":"vm-secret"}}}"#).unwrap();
+        let cfg: Config = serde_json::from_str(r#"{"targets":{"win":{"type":"fusion","vmxPath":"/VMs/Windows dev.vmx","user":"user","password":"guest-secret","vmPassword":"vm-secret","interactive":true,"elevated":true}}}"#).unwrap();
         let target = &cfg.targets["win"];
         assert_eq!(target.summary(), ("fusion", "/VMs/Windows dev.vmx"));
         let command = "Write-Output 'héllo $HOME'; exit 7";
@@ -1474,6 +1474,9 @@ mod tests {
         assert_eq!(plan.stdin.as_deref(), Some(command));
         let env = plan.env[0].1.as_ref().unwrap();
         assert!(env.contains("vm-secret"));
+        let config: serde_json::Value = serde_json::from_str(env).unwrap();
+        assert_eq!(config["interactive"], true);
+        assert_eq!(config["elevated"], true);
         assert!(!env.contains(command));
         let roundtrip: Config =
             serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
