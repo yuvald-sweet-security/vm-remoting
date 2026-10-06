@@ -20,6 +20,12 @@
       "user": "ubuntu",
       "key": "..."
     },
+    "win-ssh": {
+      "type": "ssh",
+      "host": "REPLACE-WITH-HOST-OR-IP",
+      "user": "user",
+      "shell": "powershell" // Windows OpenSSH Server; the default is "bash"
+    },
     "ubuntu": {
       "type": "wsl",
       "distro": "Ubuntu-Claude"

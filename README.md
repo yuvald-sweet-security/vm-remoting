@@ -64,6 +64,7 @@ So after `cargo install`, the zero-config home for your targets is
   "targets": {
     "winvm":  { "type": "hyperv", "vmName": "Win 11", "credPath": "C:\\Users\\you\\AppData\\Roaming\\vm-remoting\\.vm-creds\\winvm.xml" },
     "ec2":    { "type": "ssh", "host": "1.2.3.4", "user": "ubuntu", "key": "C:\\path\\to\\ec2.pem", "port": 22, "options": ["StrictHostKeyChecking=accept-new"] },
+    "winssh": { "type": "ssh", "host": "1.2.3.5", "user": "user", "shell": "powershell" },
     "ubuntu": { "type": "wsl", "distro": "Ubuntu" }
   }
 }
@@ -128,6 +129,33 @@ Set `"interactive": true` to run with the logged-in user's desktop session and i
 credential context without requesting elevation. `elevated` also selects the interactive
 session. Both options default to false; interactive execution requires an active desktop
 login for the configured user.
+
+### Windows hosts over OpenSSH
+
+Windows OpenSSH Server runs remote commands through `cmd.exe`, so the default `bash -ls`
+does not exist there. Set `"shell": "powershell"` on the `ssh` target (the default is
+`"bash"`):
+
+```json
+"win-ssh": { "type": "ssh", "host": "172.16.79.128", "user": "user", "key": "~/.ssh/id_ed25519", "shell": "powershell" }
+```
+
+The server then runs `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy
+Bypass -Command <bootstrap>`. The bootstrap is a fixed string with nothing `cmd.exe` would
+interpret. It reads the whole command from stdin as UTF-8 and runs it as a single script,
+so quotes, Unicode, here-strings and multi-line blocks arrive intact. This avoids two
+alternatives that fail:
+
+- `-Command -` parses stdin a line at a time, which breaks multi-line blocks.
+- `-EncodedCommand` makes Windows PowerShell serialize stderr as `#< CLIXML`.
+
+Semantics match Fusion targets: terminating errors are on, progress output is off, and
+output is UTF-8. The exit code is taken from an explicit `exit N` first, then from the last
+native exit code, and is 1 if the last statement failed. Background jobs work the same as
+on any other `ssh` target, except that `job_stop` leaves the guest command running here:
+sshd does not kill `powershell.exe` when the client disconnects. Kill it explicitly with
+`Stop-Process`. `list_targets` shows these targets as `ssh-ps`. As with bash, the
+command arrives on stdin, so it cannot read stdin itself.
 
 ### Bash dispatcher
 
