@@ -6,7 +6,8 @@
       "vmxPath": "/Users/you/Virtual Machines.localized/Windows.vmwarevm/Windows.vmx",
       "user": "user",
       "password": "GUEST-PASSWORD",
-      "vmPassword": "VM-ENCRYPTION-PASSWORD"
+      "vmPassword": "VM-ENCRYPTION-PASSWORD",
+      "elevated": false
     },
     "winvm": {
       "type": "hyperv",

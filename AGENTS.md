@@ -186,6 +186,16 @@ executable path. Explicit PowerShell exits and native exit codes propagate. Outp
 are copied back during execution. Timeout/job-stop can leave the guest command running
 and temporary files behind; normal completion cleans them up.
 
+For administrator execution, set `"elevated": true` on the Fusion target. The configured
+user must be logged into the Windows desktop. This uses `vmrun -interactive` with Windows
+`RunAs`, verifies an administrator token, and respects UAC consent prompts. Approve any
+required consent in the guest UI; cancellation is reported as failure. Restart the MCP
+host after updating the binary to load this new field.
+
+Set `"interactive": true` without `elevated` for the logged-in desktop session and
+credential store without an elevation request. `elevated` also selects that session.
+Both options require an active desktop login for the configured user.
+
 ## Adding a target
 
 Edit the shared config (default `%APPDATA%\vm-remoting\.vm-targets.json`; used by both the

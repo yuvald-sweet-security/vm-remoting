@@ -110,7 +110,24 @@ are uploaded as UTF-8 files, preserving quotes, Unicode, and multiline commands.
 files are polled and copied back while the command runs, and explicit `exit N`, native
 exit codes, and PowerShell errors propagate. Background jobs use the same transport.
 Timeouts and `job_stop` stop watching; the guest command can continue and temporary files
-can remain. Normal completion removes the temporary guest and host files.
+can remain. Guest file checks and transfers retry transient failures up to five times.
+Transport failures preserve guest files and report their path, so a running command can
+be recovered. Normal completion removes the temporary guest and host files.
+
+To run Fusion commands as Administrator, set `"elevated": true` on the target. The
+configured user must be logged into the Windows desktop and have administrator access.
+The dispatcher uses `vmrun -interactive` to launch Windows' `RunAs` elevation flow, then
+verifies the administrator token before executing the command. UAC stays enabled; if the
+guest policy requires consent, approve the prompt in the VM. A single elevated command
+can run an entire installation script and its child installers. Cancellation returns a
+failed command with the Windows error. Without `elevated`, commands use the normal
+VMware Tools session and token. Restart the MCP host after installing this feature so
+it recognizes the new target field.
+
+Set `"interactive": true` to run with the logged-in user's desktop session and its
+credential context without requesting elevation. `elevated` also selects the interactive
+session. Both options default to false; interactive execution requires an active desktop
+login for the configured user.
 
 ### Bash dispatcher
 
