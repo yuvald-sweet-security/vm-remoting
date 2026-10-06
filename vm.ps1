@@ -95,8 +95,19 @@ function Get-TargetDef($cfg, $name) {
     $def
 }
 
-function Invoke-OnTarget($def, [string]$commandLine) {
+function Invoke-OnTarget($name, $def, [string]$commandLine) {
+    $worker = if ($env:VM_REMOTING_MCP) { $env:VM_REMOTING_MCP } else { 'vm-remoting-mcp' }
     switch ($def.type) {
+        'fusion' {
+            $previous = $env:VM_FUSION_TARGET
+            try {
+                $env:VM_FUSION_TARGET = $def | ConvertTo-Json -Depth 10 -Compress
+                $commandLine | & $worker --fusion-worker
+                $script:TargetExit = $LASTEXITCODE
+            } finally {
+                $env:VM_FUSION_TARGET = $previous
+            }
+        }
         'hyperv' {
             $params = @{ VMName = $def.vmName }
             if ($def.credPath) {
@@ -121,6 +132,19 @@ function Invoke-OnTarget($def, [string]$commandLine) {
             }
         }
         'ssh' {
+            if ($def.shell -eq 'powershell') {
+                # Windows OpenSSH hosts: the Rust dispatcher owns the PowerShell bootstrap
+                # that keeps the command off the remote cmd.exe command line.
+                $previous = $env:VM_TARGETS_FILE
+                try {
+                    $env:VM_TARGETS_FILE = $ConfigPath
+                    & $worker --cli --target $name $commandLine
+                    $script:TargetExit = $LASTEXITCODE
+                } finally {
+                    $env:VM_TARGETS_FILE = $previous
+                }
+                break
+            }
             $sshArgs = @()
             if ($def.key)  { $sshArgs += @('-i', $def.key) }
             if ($def.port) { $sshArgs += @('-p', "$($def.port)") }
@@ -153,7 +177,7 @@ switch ($first) {
         $cfg.targets.PSObject.Properties | ForEach-Object {
             $marker = if ($_.Name -eq $cfg.current) { '*' } else { ' ' }
             "{0} {1,-12} {2,-7} {3}" -f $marker, $_.Name, $_.Value.type,
-                ($_.Value.vmName ?? $_.Value.host ?? $_.Value.distro)
+                ($_.Value.vmName ?? $_.Value.vmxPath ?? $_.Value.host ?? $_.Value.distro)
         }
         break
     }
@@ -185,7 +209,7 @@ switch ($first) {
         $def  = Get-TargetDef $cfg $name
         $commandLine = $Rest -join ' '
         $script:TargetExit = 0
-        Invoke-OnTarget $def $commandLine    # command output streams straight through
+        Invoke-OnTarget $name $def $commandLine    # command output streams straight through
         exit ($script:TargetExit ?? 0)
     }
 }

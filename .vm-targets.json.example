@@ -1,6 +1,14 @@
 {
   "current": "ubuntu",
   "targets": {
+    "fusion-win": {
+      "type": "fusion",
+      "vmxPath": "/Users/you/Virtual Machines.localized/Windows.vmwarevm/Windows.vmx",
+      "user": "user",
+      "password": "GUEST-PASSWORD",
+      "vmPassword": "VM-ENCRYPTION-PASSWORD",
+      "elevated": false
+    },
     "winvm": {
       "type": "hyperv",
       "vmName": "Windows 11",
@@ -11,6 +19,12 @@
       "host": "REPLACE-WITH-HOST-OR-IP",
       "user": "ubuntu",
       "key": "..."
+    },
+    "win-ssh": {
+      "type": "ssh",
+      "host": "REPLACE-WITH-HOST-OR-IP",
+      "user": "user",
+      "shell": "powershell" // Windows OpenSSH Server; the default is "bash"
     },
     "ubuntu": {
       "type": "wsl",

@@ -1,19 +1,20 @@
 # vm-remoting
 
 Run a command on a configured remote target — a **Hyper-V VM** (via PowerShell Direct), an
-**SSH host / EC2 box**, or a **WSL distro** — and stream the output back. Targets live in a
+**Windows VM in VMware Fusion**, an **SSH host / EC2 box**, or a **WSL distro** — and stream the output back. Targets live in a
 single `.vm-targets.json`, selected by name.
 
-Two front-ends share that config:
+Three front-ends share that config:
 
 | Front-end | What it is | Use it for |
 |---|---|---|
 | **`vm-remoting-mcp`** | A native Rust [MCP](https://modelcontextprotocol.io) server (`src/main.rs`) exposing `list_targets`, `run_command` and background-job tools. | Agents / Claude Code. |
 | **`vm.ps1`** | The original stateless PowerShell dispatcher. | Humans at a terminal. |
+| **`vm.sh`** | Bash entry point using the Rust dispatcher's terminal mode. | Humans at a Bash terminal. |
 
 The MCP server is a self-contained reimplementation — it does **not** shell out to `vm.ps1`.
 It drives `wsl.exe` and `ssh` directly and uses `pwsh` only for Hyper-V (PowerShell Direct
-is the only way into a Hyper-V guest). Both front-ends read the same config, so they
+is the only way into a Hyper-V guest). Fusion uses `vmrun` and VMware Tools. All front-ends read the same config, so they
 interoperate.
 
 ## Build & test
@@ -63,6 +64,7 @@ So after `cargo install`, the zero-config home for your targets is
   "targets": {
     "winvm":  { "type": "hyperv", "vmName": "Win 11", "credPath": "C:\\Users\\you\\AppData\\Roaming\\vm-remoting\\.vm-creds\\winvm.xml" },
     "ec2":    { "type": "ssh", "host": "1.2.3.4", "user": "ubuntu", "key": "C:\\path\\to\\ec2.pem", "port": 22, "options": ["StrictHostKeyChecking=accept-new"] },
+    "winssh": { "type": "ssh", "host": "1.2.3.5", "user": "user", "shell": "powershell" },
     "ubuntu": { "type": "wsl", "distro": "Ubuntu" }
   }
 }
@@ -83,6 +85,92 @@ machine that created it, and required for non-interactive use:
 
 Then set `"credPath"` to the absolute path it prints (Windows does not expand `%APPDATA%`
 inside the JSON, so paste the literal path). If it's missing, `run_command` returns a clear error.
+
+### Windows guests in VMware Fusion
+
+The VM must be running with VMware Tools installed. Add a target like:
+
+```json
+"fusion-win": {
+  "type": "fusion",
+  "vmxPath": "/Users/you/Virtual Machines.localized/Windows.vmwarevm/Windows.vmx",
+  "user": "user",
+  "password": "GUEST-PASSWORD",
+  "vmPassword": "VM-ENCRYPTION-PASSWORD"
+}
+```
+
+Passwords are literal strings in the target config. `vmPassword` is optional for
+unencrypted VMs. Fusion can
+save the encryption password in macOS Keychain under **VMware Fusion encryption**.
+`vmrun` requires passwords as process arguments, so they are visible to host processes
+that can inspect command lines; the dispatcher redacts them from diagnostic messages.
+
+Commands run in Windows PowerShell with no profile and terminating errors enabled. Scripts
+are uploaded as UTF-8 files, preserving quotes, Unicode, and multiline commands. Output
+files are polled and copied back while the command runs, and explicit `exit N`, native
+exit codes, and PowerShell errors propagate. Background jobs use the same transport.
+Timeouts and `job_stop` stop watching; the guest command can continue and temporary files
+can remain. Guest file checks and transfers retry transient failures up to five times.
+Transport failures preserve guest files and report their path, so a running command can
+be recovered. Normal completion removes the temporary guest and host files.
+
+To run Fusion commands as Administrator, set `"elevated": true` on the target. The
+configured user must be logged into the Windows desktop and have administrator access.
+The dispatcher uses `vmrun -interactive` to launch Windows' `RunAs` elevation flow, then
+verifies the administrator token before executing the command. UAC stays enabled; if the
+guest policy requires consent, approve the prompt in the VM. A single elevated command
+can run an entire installation script and its child installers. Cancellation returns a
+failed command with the Windows error. Without `elevated`, commands use the normal
+VMware Tools session and token. Restart the MCP host after installing this feature so
+it recognizes the new target field.
+
+Set `"interactive": true` to run with the logged-in user's desktop session and its
+credential context without requesting elevation. `elevated` also selects the interactive
+session. Both options default to false; interactive execution requires an active desktop
+login for the configured user.
+
+### Windows hosts over OpenSSH
+
+Windows OpenSSH Server runs remote commands through `cmd.exe`, so the default `bash -ls`
+does not exist there. Set `"shell": "powershell"` on the `ssh` target (the default is
+`"bash"`):
+
+```json
+"win-ssh": { "type": "ssh", "host": "172.16.79.128", "user": "user", "key": "~/.ssh/id_ed25519", "shell": "powershell" }
+```
+
+The server then runs `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy
+Bypass -Command <bootstrap>`. The bootstrap is a fixed string with nothing `cmd.exe` would
+interpret. It reads the whole command from stdin as UTF-8 and runs it as a single script,
+so quotes, Unicode, here-strings and multi-line blocks arrive intact. This avoids two
+alternatives that fail:
+
+- `-Command -` parses stdin a line at a time, which breaks multi-line blocks.
+- `-EncodedCommand` makes Windows PowerShell serialize stderr as `#< CLIXML`.
+
+Semantics match Fusion targets: terminating errors are on, progress output is off, and
+output is UTF-8. The exit code is taken from an explicit `exit N` first, then from the last
+native exit code, and is 1 if the last statement failed. Background jobs work the same as
+on any other `ssh` target, except that `job_stop` leaves the guest command running here:
+sshd does not kill `powershell.exe` when the client disconnects. Kill it explicitly with
+`Stop-Process`. `list_targets` shows these targets as `ssh-ps`. As with bash, the
+command arrives on stdin, so it cannot read stdin itself.
+
+### Bash dispatcher
+
+```bash
+./vm.sh list
+./vm.sh use fusion-win
+./vm.sh --target fusion-win 'Get-ComputerInfo | Select-Object WindowsProductName'
+./vm.sh --target linuxvm-ubuntu 'uname -a'
+```
+
+`-Target` is also accepted. Pass the entire guest command as one quoted argument.
+`vm.sh` uses `VM_REMOTING_MCP`, then the installed binary on PATH, then a local release
+or debug build. Terminal commands stream output and wait without the MCP foreground
+timeout. `save-cred` delegates to `vm.ps1` using PowerShell for the interactive Hyper-V
+credential prompt. Fusion dispatch in `vm.ps1` also requires the Rust binary.
 
 ## Register with Claude Code
 
@@ -160,6 +248,8 @@ Finished jobs are dropped from the registry once they age past the retention win
 | `VM_TARGETS_FILE` | Use this exact config file. Shared with `vm.ps1`. |
 | `VM_CONFIG_DIR` | Look for `.vm-targets.json` in this directory. Shared with `vm.ps1`. |
 | `VM_REMOTING_PWSH` | PowerShell executable for Hyper-V targets (default `pwsh`). |
+| `VM_REMOTING_VMRUN` | Fusion `vmrun` executable (default `/Applications/VMware Fusion.app/Contents/Library/vmrun`). |
+| `VM_REMOTING_MCP` | Rust binary used by the shell dispatchers. |
 | `VM_REMOTING_SSH` | SSH client for `ssh` targets (default `ssh`). Useful on Windows, where System32's OpenSSH, Git's bundled copy and a Scoop/Cygwin build can all be on `PATH` and behave differently. |
 | `VM_REMOTING_TIMEOUT_MS` | Default foreground timeout in ms (default `600000`); `0` waits forever. |
 | `VM_REMOTING_JOB_TTL_DAYS` | How long finished jobs stay in the registry (default `7`); `0` keeps them for the session. |

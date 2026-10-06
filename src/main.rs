@@ -5,10 +5,14 @@
 //! command line, so transport-layer quoting can't corrupt it:
 //!   * `wsl`    → `wsl.exe -d <distro> [-u <user>] -- bash -ls`   (command on stdin)
 //!   * `ssh`    → `ssh [-i key] [-p port] -o BatchMode=yes [-o opt]... <dest> bash -ls` (command on
-//!     stdin)
+//!     stdin), or `<dest> powershell.exe ... -Command <bootstrap>` for `"shell": "powershell"`
+//!     targets such as Windows OpenSSH Server, whose default shell is `cmd.exe` (command on stdin,
+//!     read and run by the fixed bootstrap)
 //!   * `hyperv` → `pwsh` running `Invoke-Command -VMName ... [-Credential ...]` (PowerShell Direct
 //!     is the only way into a Hyper-V guest, so this one backend needs PowerShell — the dispatch
 //!     logic itself lives here; the command travels in via `$env:VM_GUEST_CMD`).
+//!   * `fusion` → a child worker using Fusion's `vmrun` and VMware Tools to transfer a PowerShell
+//!     script and poll its output files and exit status.
 //!
 //! Commands can also run as **background jobs**. A foreground call cannot return until the
 //! transport's stdout/stderr pipes hit EOF, and any process backgrounded inside the guest
@@ -44,7 +48,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indexmap::IndexMap;
 use rmcp::{
     ErrorData as McpError, ServerHandler, ServiceExt,
@@ -53,13 +57,15 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
     transport::stdio,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::oneshot,
 };
 use tracing_subscriber::EnvFilter;
+
+mod fusion;
 
 /// Foreground timeout applied when a call does not pass one. Overridable with
 /// `VM_REMOTING_TIMEOUT_MS`; `0` disables the bound entirely. A hung guest command would
@@ -102,10 +108,57 @@ Invoke-Command @params -ScriptBlock {
 exit $script:code
 "#;
 
+/// Fixed `-Command` text that `powershell` ssh targets run. It reads the whole of stdin as
+/// UTF-8, installs it as the body of a function named `vm-remoting` and calls it, so the
+/// script runs without ever being parsed by the remote `cmd.exe` or by PowerShell's
+/// line-at-a-time `-Command -` reader (which mis-handles multi-line blocks). Calling a named
+/// function rather than an anonymous script block also keeps `Write-Error` records prefixed
+/// with `vm-remoting` instead of the whole script text.
+///
+/// It has to survive the remote `cmd.exe /c`, so it contains no spaces, double quotes or cmd
+/// metacharacters (`&|<>^%!`). `-EncodedCommand` would avoid that constraint, but Windows
+/// PowerShell then serializes stderr as `#< CLIXML`.
+const POWERSHELL_STDIN_BOOTSTRAP: &str =
+    "$ErrorActionPreference='Stop';$m=[IO.MemoryStream]::new();[Console]::OpenStandardInput().\
+     CopyTo($m);${function:vm-remoting}=[Text.UTF8Encoding]::new($false).GetString($m.ToArray());\
+     vm-remoting";
+
+/// Script fed on stdin to a `powershell` ssh target: `command` wrapped with the same
+/// semantics as Fusion targets — terminating errors on, UTF-8 output, and the process exit
+/// code taken from an explicit `exit N`, else the last native exit code, else 1 if the last
+/// statement failed.
+fn powershell_script(command: &str) -> String {
+    [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)",
+        "$global:LASTEXITCODE = 0",
+        command,
+        "if (-not $?) { if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; exit 1 }",
+        "exit $LASTEXITCODE",
+    ]
+    .join("\n")
+}
+
+/// Shell that runs the command on an `ssh` target.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Shell {
+    /// `bash -ls`: a login shell reading the command from stdin.
+    #[default]
+    Bash,
+    /// Windows PowerShell (`powershell.exe`), for Windows OpenSSH Server hosts.
+    Powershell,
+}
+
 /// A single remoting target, as stored in `.vm-targets.json`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Target {
+    Fusion {
+        #[serde(flatten)]
+        config: fusion::FusionTarget,
+    },
     Hyperv {
         #[serde(rename = "vmName")]
         vm_name: String,
@@ -122,6 +175,8 @@ enum Target {
         port: Option<u16>,
         #[serde(default)]
         options: Vec<String>,
+        #[serde(default)]
+        shell: Shell,
     },
     Wsl {
         #[serde(default)]
@@ -135,8 +190,18 @@ impl Target {
     /// `(kind, label)` for the `list_targets` display.
     fn summary(&self) -> (&'static str, &str) {
         match self {
+            Target::Fusion { config } => ("fusion", &config.vmx_path),
             Target::Hyperv { vm_name, .. } => ("hyperv", vm_name),
-            Target::Ssh { host, .. } => ("ssh", host),
+            Target::Ssh {
+                host,
+                shell: Shell::Bash,
+                ..
+            } => ("ssh", host),
+            Target::Ssh {
+                host,
+                shell: Shell::Powershell,
+                ..
+            } => ("ssh-ps", host),
             Target::Wsl { distro, .. } => ("wsl", distro.as_deref().unwrap_or("(default)")),
         }
     }
@@ -148,6 +213,7 @@ impl Target {
 /// `ProxyCommand` support.
 #[derive(Debug, Clone)]
 struct Programs {
+    worker: String,
     /// PowerShell executable used for `hyperv` targets only. `VM_REMOTING_PWSH`.
     pwsh: String,
     /// SSH client used for `ssh` targets. `VM_REMOTING_SSH`.
@@ -157,13 +223,17 @@ struct Programs {
 impl Programs {
     fn from_env() -> Self {
         Self {
+            worker: env::current_exe()
+                .expect("server executable path")
+                .to_string_lossy()
+                .into_owned(),
             pwsh: env::var("VM_REMOTING_PWSH").unwrap_or_else(|_| "pwsh".to_string()),
             ssh: env::var("VM_REMOTING_SSH").unwrap_or_else(|_| "ssh".to_string()),
         }
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct Config {
     #[serde(default)]
     current: Option<String>,
@@ -243,12 +313,22 @@ struct CommandPlan {
 /// spawn.
 ///
 /// For `wsl`/`ssh` the guest command is delivered over stdin to `bash -ls` (a login shell
-/// reading from stdin) rather than as an argv element. Passing it as an argument means it
+/// reading from stdin), or to [`POWERSHELL_STDIN_BOOTSTRAP`] on `powershell` ssh targets,
+/// rather than as an argv element. Passing it as an argument means it
 /// survives two rounds of quoting (Rust's Windows command-line encoding, then `wsl.exe`/
 /// `ssh.exe`'s own parsing), which corrupts quotes — e.g. single-quoted text gets expanded.
 /// stdin sidesteps all of that. Hyper-V already avoids the problem via environment variables.
 fn plan_command(progs: &Programs, target: &Target, command: &str) -> CommandPlan {
     match target {
+        Target::Fusion { config } => CommandPlan {
+            program: progs.worker.clone(),
+            args: vec!["--fusion-worker".into()],
+            env: vec![(
+                "VM_FUSION_TARGET".into(),
+                Some(serde_json::to_string(config).expect("serializable Fusion target")),
+            )],
+            stdin: Some(command.to_string()),
+        },
         Target::Wsl { distro, user } => {
             let mut args = Vec::new();
             if let Some(d) = distro {
@@ -273,6 +353,7 @@ fn plan_command(progs: &Programs, target: &Target, command: &str) -> CommandPlan
             key,
             port,
             options,
+            shell,
         } => {
             let mut args = Vec::new();
             if let Some(k) = key {
@@ -293,14 +374,34 @@ fn plan_command(progs: &Programs, target: &Target, command: &str) -> CommandPlan
                 Some(u) => format!("{u}@{host}"),
                 None => host.clone(),
             });
-            // Run a login shell that reads the command from the forwarded stdin.
-            args.push("bash".into());
-            args.push("-ls".into());
+            let stdin = match shell {
+                // Run a login shell that reads the command from the forwarded stdin.
+                Shell::Bash => {
+                    args.extend(["bash".into(), "-ls".into()]);
+                    command.to_string()
+                }
+                Shell::Powershell => {
+                    args.extend(
+                        [
+                            "powershell.exe",
+                            "-NoLogo",
+                            "-NoProfile",
+                            "-NonInteractive",
+                            "-ExecutionPolicy",
+                            "Bypass",
+                            "-Command",
+                            POWERSHELL_STDIN_BOOTSTRAP,
+                        ]
+                        .map(String::from),
+                    );
+                    powershell_script(command)
+                }
+            };
             CommandPlan {
                 program: progs.ssh.clone(),
                 args,
                 env: Vec::new(),
-                stdin: Some(command.to_string()),
+                stdin: Some(stdin),
             }
         }
         Target::Hyperv { vm_name, cred_path } => CommandPlan {
@@ -460,7 +561,8 @@ fn tail_lines(text: &str, tail: u32) -> (String, usize, usize) {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct RunArgs {
     /// The command line to run on the target, written for the target's native shell
-    /// (PowerShell for `hyperv` targets, bash for `ssh`/`wsl` targets).
+    /// (PowerShell for `hyperv`/`fusion` targets and `ssh` targets configured with
+    /// `"shell": "powershell"`, bash for other `ssh` and `wsl` targets).
     command: String,
     /// Optional target name (see `list_targets`). Omit to run on the configured active
     /// target — that is the default and preferred for most calls. Set this only when a
@@ -650,8 +752,9 @@ impl VmServer {
             McpError::internal_error(format!("failed to launch '{}': {e}", plan.program), None)
         })?;
 
-        // Feed the guest command over stdin (wsl/ssh), then close it so `bash -ls` hits EOF
-        // and runs. The payload is tiny, so writing it before draining output can't deadlock.
+        // Feed the guest command over stdin (wsl/ssh), then close it so the guest shell hits
+        // EOF and runs it. The payload is tiny, so writing it before draining output can't
+        // deadlock.
         if let Some(input) = &plan.stdin {
             let mut child_stdin = child.stdin.take().expect("stdin was piped");
             child_stdin
@@ -808,9 +911,9 @@ impl VmServer {
     }
 
     #[tool(
-        description = "List the configured remoting targets (Hyper-V VMs, SSH/EC2 hosts, WSL \
-                       distros). The active target — used by run_command when no target is given \
-                       — is marked with '*'."
+        description = "List the configured remoting targets (Hyper-V and Fusion VMs, SSH/EC2 \
+                       hosts, WSL distros). The active target — used by run_command when no \
+                       target is given — is marked with '*'."
     )]
     async fn list_targets(&self) -> Result<CallToolResult, McpError> {
         let cfg = self.load_config()?;
@@ -829,12 +932,15 @@ impl VmServer {
         description = "Run a command on a remoting target and return its combined output and exit \
                        code. Defaults to the configured active target; pass `target` only when a \
                        specific VM is required. The command runs as a PowerShell command line on \
-                       hyperv targets and on stdin to `bash -ls` (a login shell, so the command \
-                       cannot itself read stdin) on ssh/wsl targets. Set `background` for \
-                       anything long-running — builds, test suites, installs — to get a job id \
-                       back immediately instead of waiting; trying to background inside the \
-                       command (`cmd &`, `nohup`) does not work, because the call blocks until \
-                       the guest closes the transport's output pipes."
+                       hyperv/fusion targets, as a Windows PowerShell script on ssh targets \
+                       configured with \"shell\": \"powershell\" (Windows OpenSSH hosts, listed \
+                       as `ssh-ps` by list_targets), and on stdin to `bash -ls` (a login shell) \
+                       on other ssh and wsl targets. The command is delivered on stdin for \
+                       ssh/wsl, so it cannot itself read stdin. Set `background` for anything \
+                       long-running — builds, test suites, installs — to get a job id back \
+                       immediately instead of waiting; trying to background inside the command \
+                       (`cmd &`, `nohup`) does not work, because the call blocks until the guest \
+                       closes the transport's output pipes."
     )]
     async fn run_command(
         &self,
@@ -1184,6 +1290,15 @@ impl ServerHandler for VmServer {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if env::args().nth(1).as_deref() == Some("--cli") {
+        std::process::exit(run_cli(env::args().skip(2).collect()).await?);
+    }
+    if env::args().nth(1).as_deref() == Some("--fusion-worker") {
+        let config: fusion::FusionTarget = serde_json::from_str(&env::var("VM_FUSION_TARGET")?)?;
+        let mut command = String::new();
+        tokio::io::stdin().read_to_string(&mut command).await?;
+        std::process::exit(fusion::run(&config, &command).await?);
+    }
     // All logging MUST go to stderr — stdout is the JSON-RPC channel for the stdio transport.
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1204,6 +1319,88 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn run_cli(mut args: Vec<String>) -> Result<i32> {
+    let server = VmServer::new();
+    let mut config = server.load_config().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let requested = if args
+        .first()
+        .is_some_and(|s| s == "--target" || s == "-Target")
+    {
+        if args.len() < 3 {
+            anyhow::bail!("usage: vm.sh --target <name> <command>");
+        }
+        args.remove(0);
+        Some(args.remove(0))
+    } else {
+        None
+    };
+    match args.first().map(String::as_str) {
+        None => {
+            println!(
+                "Usage: vm.sh [--target <name>] <command> | list | use <name> | save-cred <name>"
+            );
+            return Ok(0);
+        }
+        Some("list") if requested.is_none() => {
+            println!("{}", render_list(&config));
+            return Ok(0);
+        }
+        Some("use") if requested.is_none() => {
+            if args.len() != 2 {
+                anyhow::bail!("usage: vm.sh use <name>");
+            }
+            server
+                .resolve(&config, Some(&args[1]))
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            config.current = Some(args[1].clone());
+            let parent = server
+                .targets_file
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            std::fs::create_dir_all(parent)?;
+            let mut file = tempfile::NamedTempFile::new_in(parent)?;
+            std::io::Write::write_all(
+                &mut file,
+                serde_json::to_string_pretty(&config)?.as_bytes(),
+            )?;
+            file.persist(&server.targets_file)?;
+            println!("Active target -> {}", args[1]);
+            return Ok(0);
+        }
+        _ => {}
+    }
+    let (_, target) = server
+        .resolve(&config, requested.as_deref())
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let plan = plan_command(&server.programs, target, &args.join(" "));
+    let mut transport = Command::new(&plan.program);
+    transport
+        .args(&plan.args)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true);
+    for (key, value) in &plan.env {
+        match value {
+            Some(value) => transport.env(key, value),
+            None => transport.env_remove(key),
+        };
+    }
+    transport.stdin(if plan.stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+    let mut child = transport
+        .spawn()
+        .with_context(|| format!("failed to launch '{}'", plan.program))?;
+    if let Some(input) = plan.stdin {
+        let mut stdin = child.stdin.take().expect("piped command input");
+        stdin.write_all(format!("{input}\n").as_bytes()).await?;
+    }
+    Ok(child.wait().await?.code().unwrap_or(1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1219,6 +1416,7 @@ mod tests {
                 "nocred": { "type": "hyperv", "vmName": "Win VHLK" },
                 "ec2":    { "type": "ssh", "host": "1.2.3.4", "user": "ubuntu", "key": "k.pem", "port": 2222, "options": ["StrictHostKeyChecking=accept-new"] },
                 "bare":   { "type": "ssh", "host": "h" },
+                "win":    { "type": "ssh", "host": "w", "shell": "powershell" },
                 "ubuntu": { "type": "wsl", "distro": "Ubuntu-Claude" },
                 "wsldef": { "type": "wsl" }
             }
@@ -1228,7 +1426,7 @@ mod tests {
         let names: Vec<&str> = cfg.targets.keys().map(String::as_str).collect();
         assert_eq!(
             names,
-            ["winvm", "nocred", "ec2", "bare", "ubuntu", "wsldef"]
+            ["winvm", "nocred", "ec2", "bare", "win", "ubuntu", "wsldef"]
         );
 
         match &cfg.targets["winvm"] {
@@ -1249,12 +1447,14 @@ mod tests {
                 key,
                 port,
                 options,
+                shell,
             } => {
                 assert_eq!(host, "1.2.3.4");
                 assert_eq!(user.as_deref(), Some("ubuntu"));
                 assert_eq!(key.as_deref(), Some("k.pem"));
                 assert_eq!(*port, Some(2222));
                 assert_eq!(options, &["StrictHostKeyChecking=accept-new"]);
+                assert_eq!(*shell, Shell::Bash);
             }
             other => panic!("expected ssh, got {other:?}"),
         }
@@ -1265,11 +1465,17 @@ mod tests {
                 key,
                 port,
                 options,
+                shell,
             } => {
                 assert_eq!(host, "h");
                 assert!(user.is_none() && key.is_none() && port.is_none());
                 assert!(options.is_empty());
+                assert_eq!(*shell, Shell::Bash);
             }
+            other => panic!("expected ssh, got {other:?}"),
+        }
+        match &cfg.targets["win"] {
+            Target::Ssh { shell, .. } => assert_eq!(*shell, Shell::Powershell),
             other => panic!("expected ssh, got {other:?}"),
         }
     }
@@ -1279,6 +1485,12 @@ mod tests {
         let cfg: Config = serde_json::from_str("{}").unwrap();
         assert!(cfg.current.is_none());
         assert!(cfg.targets.is_empty());
+    }
+
+    #[test]
+    fn unknown_ssh_shell_is_rejected() {
+        let json = r#"{ "targets": { "x": { "type": "ssh", "host": "h", "shell": "zsh" } } }"#;
+        assert!(serde_json::from_str::<Config>(json).is_err());
     }
 
     #[test]
@@ -1301,6 +1513,7 @@ mod tests {
             key: None,
             port: None,
             options: vec![],
+            shell: Shell::Bash,
         };
         let wsl = Target::Wsl {
             distro: Some("U".into()),
@@ -1311,7 +1524,16 @@ mod tests {
             user: None,
         };
         assert_eq!(hv.summary(), ("hyperv", "VM"));
+        let ssh_ps = Target::Ssh {
+            host: "w".into(),
+            user: None,
+            key: None,
+            port: None,
+            options: vec![],
+            shell: Shell::Powershell,
+        };
         assert_eq!(ssh.summary(), ("ssh", "h"));
+        assert_eq!(ssh_ps.summary(), ("ssh-ps", "w"));
         assert_eq!(wsl.summary(), ("wsl", "U"));
         assert_eq!(wsl_def.summary(), ("wsl", "(default)"));
     }
@@ -1343,9 +1565,30 @@ mod tests {
 
     fn progs(pwsh: &str, ssh: &str) -> Programs {
         Programs {
+            worker: "vm-remoting-mcp".into(),
             pwsh: pwsh.into(),
             ssh: ssh.into(),
         }
+    }
+
+    #[test]
+    fn fusion_config_and_plan_keep_command_off_argv() {
+        let cfg: Config = serde_json::from_str(r#"{"targets":{"win":{"type":"fusion","vmxPath":"/VMs/Windows dev.vmx","user":"user","password":"guest-secret","vmPassword":"vm-secret","interactive":true,"elevated":true}}}"#).unwrap();
+        let target = &cfg.targets["win"];
+        assert_eq!(target.summary(), ("fusion", "/VMs/Windows dev.vmx"));
+        let command = "Write-Output 'héllo $HOME'; exit 7";
+        let plan = plan_command(&progs("pwsh", "ssh"), target, command);
+        assert_eq!(args_of(&plan), ["--fusion-worker"]);
+        assert_eq!(plan.stdin.as_deref(), Some(command));
+        let env = plan.env[0].1.as_ref().unwrap();
+        assert!(env.contains("vm-secret"));
+        let config: serde_json::Value = serde_json::from_str(env).unwrap();
+        assert_eq!(config["interactive"], true);
+        assert_eq!(config["elevated"], true);
+        assert!(!env.contains(command));
+        let roundtrip: Config =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(roundtrip.targets["win"].summary(), target.summary());
     }
 
     #[test]
@@ -1384,6 +1627,7 @@ mod tests {
             key: Some("k.pem".into()),
             port: Some(2222),
             options: vec!["StrictHostKeyChecking=accept-new".into()],
+            shell: Shell::Bash,
         };
         let plan = plan_command(&progs("pwsh", "ssh"), &t, "ls -la");
         assert_eq!(plan.program, "ssh");
@@ -1414,6 +1658,7 @@ mod tests {
             key: None,
             port: None,
             options: vec![],
+            shell: Shell::Bash,
         };
         let plan = plan_command(&progs("pwsh", "ssh"), &t, "whoami");
         assert_eq!(
@@ -1421,6 +1666,72 @@ mod tests {
             ["-o", "BatchMode=yes", "host", "bash", "-ls"]
         );
         assert_eq!(plan.stdin.as_deref(), Some("whoami"));
+    }
+
+    #[test]
+    fn plan_ssh_powershell_runs_fixed_bootstrap() {
+        let t = Target::Ssh {
+            host: "172.16.79.128".into(),
+            user: Some("user".into()),
+            key: None,
+            port: Some(22),
+            options: vec![],
+            shell: Shell::Powershell,
+        };
+        let plan = plan_command(&progs("pwsh", "ssh"), &t, "hostname");
+        assert_eq!(plan.program, "ssh");
+        assert_eq!(
+            args_of(&plan),
+            [
+                "-p",
+                "22",
+                "-o",
+                "BatchMode=yes",
+                "user@172.16.79.128",
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                POWERSHELL_STDIN_BOOTSTRAP,
+            ]
+        );
+        assert_eq!(plan.stdin, Some(powershell_script("hostname")));
+        assert!(plan.env.is_empty());
+    }
+
+    #[test]
+    fn plan_ssh_powershell_command_only_travels_on_stdin() {
+        let t = Target::Ssh {
+            host: "w".into(),
+            user: None,
+            key: None,
+            port: None,
+            options: vec![],
+            shell: Shell::Powershell,
+        };
+        let tricky = "$x = 'it''s \"q\" %PATH% ^& |'\nif ($x) {\n  $x\n}\nexit 7";
+        let plan = plan_command(&progs("pwsh", "ssh"), &t, tricky);
+        assert!(!plan.args.iter().any(|a| a.contains(tricky)));
+        let script = plan.stdin.unwrap();
+        assert!(script.contains(&format!("\n{tricky}\n")));
+        assert!(script.starts_with("$ErrorActionPreference = 'Stop'\n"));
+        assert!(script.ends_with("\nexit $LASTEXITCODE"));
+    }
+
+    #[test]
+    fn powershell_bootstrap_survives_remote_cmd_exe() {
+        // Windows OpenSSH hands the remote command line to `cmd.exe /c`, and the ssh client
+        // joins its arguments with spaces, so the bootstrap must be a single token with
+        // nothing cmd.exe would interpret.
+        assert!(
+            !POWERSHELL_STDIN_BOOTSTRAP
+                .chars()
+                .any(|c| c.is_whitespace() || "\"&|<>^%!".contains(c)),
+            "{POWERSHELL_STDIN_BOOTSTRAP}"
+        );
     }
 
     #[test]
@@ -1723,6 +2034,7 @@ mod tests {
             key: None,
             port: None,
             options: vec![],
+            shell: Shell::Bash,
         };
         let plan = plan_command(
             &progs("pwsh", r"C:\Windows\System32\OpenSSH\ssh.exe"),

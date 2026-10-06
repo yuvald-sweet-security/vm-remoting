@@ -1,11 +1,11 @@
 # Remoting to a VM / EC2 / WSL — guidance for Claude
 
 This repo provides a stateless remoting dispatcher that runs a command on a configured
-remote target (Hyper-V VM via PowerShell Direct, SSH host / EC2, or WSL distro) and streams
+remote target (Hyper-V VM, Windows guest in VMware Fusion, SSH host / EC2, or WSL distro) and streams
 the output back. Use it for any "run X on the VM / EC2 / WSL" request instead of raw
 `Invoke-Command -VMName`, `ssh`, or `wsl`.
 
-There are two front-ends, and they share the same `.vm-targets.json` config so they
+There are three front-ends, and they share the same `.vm-targets.json` config so they
 interoperate:
 
 1. **`vm-remoting` MCP server** — a native Rust server (`src/main.rs`, binary
@@ -30,9 +30,15 @@ interoperate:
 `run_command` parameters:
 
 - `command` (required) — the command line, written for the target's **native shell**:
-  PowerShell on `hyperv` targets, `bash` on `ssh`/`wsl` targets. It is delivered on stdin to
-  `bash -ls` (a login shell), so **the command cannot itself read stdin** — anything
-  interactive must be fed from a file or a heredoc inside the command.
+  PowerShell on `hyperv`/`fusion` targets and on `ssh` targets with `"shell": "powershell"`
+  (Windows OpenSSH hosts, listed as `ssh-ps`), `bash` on other `ssh`/`wsl` targets. On
+  `ssh`/`wsl` it is delivered on stdin — to `bash -ls` (a login shell), or to a fixed
+  Windows PowerShell bootstrap that runs it as one script — so **the command cannot itself
+  read stdin**. Anything interactive must be fed from a file or a heredoc inside the
+  command. `ssh-ps` targets behave like `fusion` ones: terminating errors are on, and
+  explicit `exit N` and native exit codes both propagate. On them, `job_stop` does **not**
+  kill the guest command (Windows sshd leaves `powershell.exe` running), so stop it with
+  `Stop-Process` and verify.
 - `target` (optional) — target name (see `list_targets`). **Omit it to run on the active
   target; that is the default and what you should do for most calls.** Pass it only when the
   request needs a *specific* VM — then the call is self-contained and race-free.
@@ -151,7 +157,8 @@ for vm.ps1's absolute path (`PowerShell(C:\\path\\to\\vm.ps1 *)`) match with any
 - The guest command runs as a PowerShell command line on `hyperv` targets, via `bash -lc` on
   `wsl` targets, and as an argument to `ssh` (so the remote login shell parses it) on `ssh`
   targets — write it for the target's native shell. Note this differs from the MCP server,
-  which sends the command on stdin to `bash -ls` for both `wsl` and `ssh`.
+  which sends the command on stdin to `bash -ls` for both `wsl` and `ssh`. `ssh` targets
+  with `"shell": "powershell"` are handed to the Rust binary (`vm-remoting-mcp --cli`).
 - `vm.ps1` has no equivalent of the MCP server's background jobs — it always waits.
 - Fallback if the `PowerShell` tool is unavailable (only `Bash` present): invoke via
   `pwsh -NoProfile -File C:/path/to/vm.ps1 -Target <name> '<cmd>'` and allow
@@ -189,6 +196,39 @@ which my non-interactive shell can't satisfy):
 & C:\path\to\vm.ps1 save-cred <name>
 ```
 
+## Bash fallback and Fusion targets
+
+`vm.sh` is the Bash fallback when MCP is unavailable. It shares the config and uses the
+Rust binary (`VM_REMOTING_MCP`, PATH, or a local build):
+
+```bash
+/absolute/path/to/vm.sh list
+/absolute/path/to/vm.sh --target fusion-win 'hostname; whoami'
+```
+
+`vm.sh use` and `save-cred` remain human-only operations. Fusion targets run Windows
+PowerShell through VMware Tools using Fusion's `vmrun`. The VM must be running with Tools
+installed. Put passwords directly in the config; omit `vmPassword` for unencrypted VMs:
+
+```json
+"fusion-win": { "type": "fusion", "vmxPath": "/path/Windows.vmwarevm/Windows.vmx", "user": "user", "password": "GUEST-PASSWORD", "vmPassword": "VM-ENCRYPTION-PASSWORD" }
+```
+
+`VM_REMOTING_VMRUN` overrides the Fusion
+executable path. Explicit PowerShell exits and native exit codes propagate. Output files
+are copied back during execution. Timeout/job-stop can leave the guest command running
+and temporary files behind; normal completion cleans them up.
+
+For administrator execution, set `"elevated": true` on the Fusion target. The configured
+user must be logged into the Windows desktop. This uses `vmrun -interactive` with Windows
+`RunAs`, verifies an administrator token, and respects UAC consent prompts. Approve any
+required consent in the guest UI; cancellation is reported as failure. Restart the MCP
+host after updating the binary to load this new field.
+
+Set `"interactive": true` without `elevated` for the logged-in desktop session and
+credential store without an elevation request. `elevated` also selects that session.
+Both options require an active desktop login for the configured user.
+
 ## Adding a target
 
 Edit the shared config (default `%APPDATA%\vm-remoting\.vm-targets.json`; used by both the
@@ -197,6 +237,7 @@ MCP server and `vm.ps1`). Shapes:
 ```json
 "name": { "type": "hyperv", "vmName": "...", "credPath": "<absolute path printed by save-cred>" }
 "name": { "type": "ssh",    "host": "...", "user": "...", "key": "C:\\path\\to\\name.pem", "port": 22, "options": ["StrictHostKeyChecking=accept-new"] }
+"name": { "type": "ssh",    "host": "...", "user": "...", "shell": "powershell" }   // Windows OpenSSH Server
 "name": { "type": "wsl",    "distro": "Ubuntu", "user": "..." }
 ```
 

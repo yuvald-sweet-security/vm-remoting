@@ -1,8 +1,8 @@
 [package]
 name = "vm-remoting-mcp"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2024"
-description = "MCP server exposing a multi-backend remoting dispatcher (Hyper-V / SSH / WSL) as Model Context Protocol tools"
+description = "MCP server exposing a multi-backend remoting dispatcher (Hyper-V / Fusion / SSH / WSL) as Model Context Protocol tools"
 license = "MIT"
 repository = "https://github.com/yuvald-sweet-security/vm-remoting"
 
@@ -17,6 +17,7 @@ rmcp = { version = "1.8.0", features = [
 ] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tempfile = "3"
 tokio = { version = "1", features = [
     "macros",
     "rt-multi-thread",
